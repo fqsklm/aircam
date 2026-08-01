@@ -77,7 +77,105 @@ journalctl -u aircam -n 100 --no-pager
 
 安装脚本已经执行 `systemctl enable aircam`，以后接通电源，树莓派启动后会自动运行服务。
 
-## 6. 网页操作
+## 6. 配置参数总表
+
+持久配置文件位于：
+
+```text
+/home/pi/AirCam/config/config.json
+```
+
+“持久”表示服务重启或树莓派重新上电后仍然生效。`config.example.json` 是完整模板；实际运行时修改 `config/config.json`，不要只改示例文件。
+
+### 6.1 摄像头参数 `camera`
+
+| 参数 | 模板值 | 作用与取值 |
+| --- | --- | --- |
+| `device` | `/dev/video0` | 摄像头设备路径。多摄像头环境优先使用稳定的 `/dev/v4l/by-id/...` 路径。 |
+| `input_format` | `mjpeg` | 摄像头输入格式，必须是摄像头实际支持的格式，例如 `mjpeg`。 |
+| `controls` | JSON 对象 | 服务启动时应用的 V4L2 参数。参数名和值必须由当前摄像头支持；值只能是整数或布尔值。拍摄进程自动恢复时会重新应用。 |
+
+先读取当前摄像头真正支持的控制项：
+
+```bash
+v4l2-ctl -d /dev/video0 --list-ctrls-menus
+```
+
+本项目当前实测摄像头的常用控制项如下。范围和含义仍以该命令在本机的输出为准：
+
+| 参数 | 作用 |
+| --- | --- |
+| `auto_exposure` | `1` 为手动曝光，`3` 为自动曝光。 |
+| `exposure_time_absolute` | 手动曝光时间，单位为 0.1 毫秒；例如 `100` 约为 10 毫秒。数值越小越有利于抑制高速运动模糊，但画面会更暗。 |
+| `white_balance_automatic` | `1` 自动白平衡，`0` 手动白平衡。 |
+| `white_balance_temperature` | 手动白平衡色温；通常要先关闭自动白平衡。 |
+| `power_line_frequency` | 电源频率防闪烁模式，具体菜单值由摄像头决定。 |
+| `backlight_compensation` | 逆光补偿。 |
+| `brightness`、`contrast`、`gain` 等 | 仅在摄像头列出并支持时才能设置。 |
+
+### 6.2 拍摄参数 `capture`
+
+| 参数 | 模板值 | 允许范围 | 作用 |
+| --- | ---: | ---: | --- |
+| `width` | `2592` | 正整数 | 输出照片宽度，必须与摄像头所支持的分辨率匹配。 |
+| `height` | `1944` | 正整数 | 输出照片高度，必须与摄像头所支持的分辨率匹配。 |
+| `source_fps` | `30` | `1`–`240` | 摄像头输入帧率。不能高于该分辨率下摄像头实际支持的帧率。 |
+| `interval_seconds` | `1.0` | `0.0334`–`3600` 秒 | 默认拍摄间隔。`0.0334` 秒约为每秒 30 张；实际速度还受摄像头帧率、曝光和存储速度限制。 |
+| `jpeg_quality` | `2` | `2`–`31` | FFmpeg JPEG 质量值；数值越小质量越高、文件通常越大。 |
+| `auto_restart` | `true` | `true`/`false` | 拍摄进程意外退出后是否自动恢复。 |
+| `max_restarts` | `3` | `0`–`100` | 单次拍摄任务最多自动恢复多少次；`0` 表示不尝试恢复。网页上的“恢复次数”就是本次任务已经执行的次数。 |
+| `restart_delay_seconds` | `2` | `0.1`–`300` 秒 | 每次自动恢复前等待的时间。短暂 USB 故障可在等待后恢复；等待期间可能漏拍，系统不会补拍。 |
+
+开始新的拍摄任务时，“恢复次数”会重新从 `0` 计数。恢复可能由 USB 接触或供电不稳、摄像头无响应、FFmpeg 异常退出等情况触发。
+
+### 6.3 存储参数 `storage`
+
+| 参数 | 模板值 | 允许范围 | 作用 |
+| --- | --- | --- | --- |
+| `data_dir` | `/home/pi/Pictures/AirCam` | 有写权限的非空路径 | 照片、任务清单和状态文件的保存根目录。修改后不会自动搬迁旧照片。 |
+| `min_free_mb` | `512` | `16`–`1048576` MB | 磁盘最少保留空间。低于该值时拒绝开始拍摄；拍摄中低于该值时自动停止，防止磁盘被写满。 |
+
+### 6.4 网页服务参数 `server`
+
+| 参数 | 模板值 | 作用与取值 |
+| --- | --- | --- |
+| `host` | `0.0.0.0` | 监听地址。`0.0.0.0` 表示允许通过树莓派的各网络接口访问。 |
+| `port` | `8080` | 网页端口，允许 `1`–`65535`。修改后访问地址也要改，例如 `http://树莓派IP:新端口/`。 |
+| `token` | 安装时生成 | 网页和 API 的访问令牌。修改后，浏览器中也要保存新令牌。不要把真实令牌提交到公开仓库。 |
+
+### 6.5 遥控触发参数 `gpio`
+
+| 参数 | 模板值 | 作用与取值 |
+| --- | --- | --- |
+| `enabled` | `false` | 是否启用 GPIO 电平触发。启用前必须完成 3.3V 安全接线测试。 |
+| `bcm_pin` | `17` | BCM GPIO 编号，不是排针物理编号；BCM17 对应物理针脚 11。 |
+| `active_high` | `true` | `true` 表示高电平开始拍摄、低电平停止；`false` 表示逻辑相反。 |
+| `pull_up` | `null` | `true` 使用内部上拉，`false` 使用内部下拉，`null` 不启用内部上下拉。应与外部电路和失联安全状态匹配。 |
+| `bounce_time` | `0.15` | 输入去抖时间，单位秒，用于避免机械开关抖动造成重复触发。 |
+
+GPIO 输入只允许树莓派安全的 0/3.3V 数字电平。5V、接收机舵机 PWM、SBUS 或 CRSF 都不能直接接入。
+
+### 6.6 网页临时设置与持久设置的区别
+
+- 网页选择的“拍摄间隔”只用于下一次开始的拍摄任务，不会改写 `config.json`。
+- 网页应用的曝光、白平衡等控制项会立即生效，但不会改写 `config.json`；服务重启后恢复为 `camera.controls` 中的值。
+- 要让某项参数在重新上电后仍然生效，应把它写入 `config/config.json`。
+- 修改分辨率、帧率、存储路径、服务端口、令牌、自动恢复或 GPIO 参数后，需要检查配置并重启服务。
+
+安全修改流程：
+
+```bash
+sudo nano /home/pi/AirCam/config/config.json
+sudo -u aircam python3 /home/pi/AirCam/aircam.py \
+  --config /home/pi/AirCam/config/config.json \
+  --check-config
+sudo systemctl restart aircam
+systemctl status aircam --no-pager
+```
+
+如果 `--check-config` 报错，不要重启服务；先修正 JSON、参数类型或数值范围。正在拍摄时应先在网页点击“结束拍照”，再修改配置和重启服务。
+
+## 7. 网页操作
 
 查看树莓派地址：
 
@@ -115,11 +213,11 @@ curl -X POST -H "X-AirCam-Token: $TOKEN" \
   http://aircam.local:8080/api/stop
 curl -X POST -H "X-AirCam-Token: $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"controls":{"exposure_auto":1,"exposure_absolute":100,"gain":0}}' \
+  -d '{"controls":{"auto_exposure":1,"exposure_time_absolute":100,"gain":0}}' \
   http://aircam.local:8080/api/controls
 ```
 
-## 7. 文件结构
+## 8. 文件结构
 
 默认照片位于：
 
@@ -153,20 +251,7 @@ curl -X POST -H "X-AirCam-Token: $TOKEN" \
 
 正常拍摄使用V4L2帧的绝对时间戳，比文件落盘时间更接近相机产生该帧的时刻；微秒是记录分辨率，不代表系统时钟天然具有微秒级绝对准确度。要与GPS、飞控姿态高精度对齐，还需要用GPS/PPS或网络授时校准树莓派系统时钟。
 
-配置中的可靠性选项：
-
-```json
-"capture": {
-  "auto_restart": true,
-  "max_restarts": 3,
-  "restart_delay_seconds": 2
-},
-"storage": {
-  "min_free_mb": 512
-}
-```
-
-## 8. GPIO 遥控触发
+## 9. GPIO 遥控触发
 
 先在台架上使用普通开关或 3.3V 信号验证。配置示例：
 
@@ -196,7 +281,7 @@ curl -X POST -H "X-AirCam-Token: $TOKEN" \
 - 由飞控把遥控通道映射为 3.3V GPIO；
 - 后续根据接收机型号实现 PWM、SBUS 或 CRSF 解码。
 
-## 9. 外场 Wi-Fi
+## 10. 外场 Wi-Fi
 
 最简单的方式是让树莓派连接手机热点。也可以让树莓派自己建立2.4GHz热点：
 
@@ -210,7 +295,7 @@ sudo nmcli connection up AirCam-Hotspot
 
 热点仅用于地面配置和近距离备用控制。Wi-Fi覆盖范围、机体遮挡和当地法规都可能限制连接，不能把它当作固定翼飞行中的唯一控制链路。
 
-## 10. 一键自检
+## 11. 一键自检
 
 安装并配置完成后运行：
 
@@ -224,7 +309,7 @@ sudo ./scripts/self-test.sh --capture
 
 安装完成后也可以直接运行`sudo /home/pi/AirCam/scripts/self-test.sh --capture`。
 
-## 11. 飞行可靠性检查
+## 12. 飞行可靠性检查
 
 至少完成以下测试后再装机：
 
@@ -251,7 +336,7 @@ sudo ./scripts/self-test.sh --capture
 
 完整逐项验收标准见`ACCEPTANCE.zh-CN.md`。
 
-## 12. 下一步需要确定
+## 13. 下一步需要确定
 
 为了完成飞行版配置，需要：
 
