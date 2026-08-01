@@ -1,3 +1,4 @@
+import csv
 import json
 import tempfile
 import threading
@@ -54,8 +55,15 @@ class AirCamTests(unittest.TestCase):
                 Path(tmp) / "photo_%08d.jpg", 0.5
             )
             self.assertIn("1920x1080", command)
-            self.assertIn("fps=1/0.5", command)
             self.assertIn("mjpeg", command)
+            self.assertIn("-copyts", command)
+            self.assertEqual(command[command.index("-timestamps") + 1], "abs")
+            video_filter = command[command.index("-vf") + 1]
+            self.assertIn("select=", video_filter)
+            self.assertIn("/0.5", video_filter)
+            self.assertIn("showinfo", video_filter)
+            self.assertEqual(command[command.index("-fps_mode") + 1], "vfr")
+            self.assertEqual(command[command.index("-atomic_writing") + 1], "1")
             self.assertEqual(command[command.index("-start_number") + 1], "1")
             self.assertEqual(command[-1], str(Path(tmp) / "photo_%08d.jpg"))
 
@@ -168,7 +176,47 @@ class AirCamTests(unittest.TestCase):
             session = Path(tmp)
             (session / "photo_00000001.jpg").touch()
             (session / "photo_00000007.jpg").touch()
-            self.assertEqual(aircam.CameraService._next_photo_number(session), 8)
+            (session / "photo_20240309T160000.123456Z_00000009.jpg").touch()
+            (session / "pending_00000011.jpg").touch()
+            self.assertEqual(aircam.CameraService._next_photo_number(session), 12)
+
+    def test_pending_photo_uses_exact_v4l2_timestamp_in_name_and_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = aircam.CameraService(config(tmp))
+            session = Path(tmp) / "photos" / "session"
+            session.mkdir()
+            manifest = session / "manifest.csv"
+            with manifest.open("w", encoding="utf-8", newline="") as handle:
+                csv.writer(handle).writerow(service._manifest_header())
+
+            pending = session / "pending_00000001.jpg"
+            pending.write_bytes(b"jpeg")
+            service.frame_timestamps_us[pending.name] = 1_710_000_000_123_456
+            service.control_history = [
+                (1_709_999_999.0, {"exposure_absolute": 80})
+            ]
+
+            service._record_new_photos(session, 0.5, include_recent=True)
+
+            expected = (
+                session / "photo_20240309T160000.123456Z_00000001.jpg"
+            )
+            self.assertTrue(expected.exists())
+            self.assertFalse(pending.exists())
+            with manifest.open(encoding="utf-8", newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["filename"], expected.name)
+            self.assertEqual(row["capture_unix_us"], "1710000000123456")
+            self.assertEqual(row["capture_time_source"], "v4l2_pts_abs")
+            self.assertIn("exposure_absolute", row["camera_controls_json"])
+
+    def test_pts_timebase_conversion_preserves_microseconds(self):
+        self.assertEqual(
+            aircam.CameraService._pts_to_unix_us(
+                1_710_000_000_123_456, 1, 1_000_000
+            ),
+            1_710_000_000_123_456,
+        )
 
     def test_manifest_uses_controls_active_at_photo_time(self):
         with tempfile.TemporaryDirectory() as tmp:
