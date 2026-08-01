@@ -33,6 +33,13 @@ from urllib.parse import urlparse
 LOG = logging.getLogger("aircam")
 CONTROL_NAME = re.compile(r"^[A-Za-z0-9_]+$")
 MIN_CAPTURE_INTERVAL_SECONDS = 0.0334
+SHOWINFO_TIMEBASE = re.compile(r"config in time_base:\s*(\d+)/(\d+)")
+SHOWINFO_FRAME = re.compile(r"\bn:\s*(\d+)\s+pts:\s*(-?\d+)")
+PENDING_PHOTO = re.compile(r"^pending_(\d{8})\.jpg$")
+TIMED_PHOTO = re.compile(
+    r"^photo_\d{8}T\d{6}\.\d{6}Z_(\d{8})\.jpg$"
+)
+LEGACY_PHOTO = re.compile(r"^photo_(\d{8})\.jpg$")
 
 
 class AirCamError(RuntimeError):
@@ -189,6 +196,8 @@ class CameraService:
         self.stop_event = threading.Event()
         self.session_dir: Path | None = None
         self.manifested_photos: set[str] = set()
+        self.frame_timestamps_us: dict[str, int] = {}
+        self.ffmpeg_reader_threads: dict[int, threading.Thread] = {}
         self.active_controls: dict[str, Any] = dict(
             config["camera"].get("controls", {})
         )
@@ -222,6 +231,12 @@ class CameraService:
         source_fps = int(capture.get("source_fps", 30))
         quality = int(capture.get("jpeg_quality", 2))
         input_format = str(camera.get("input_format", "mjpeg"))
+        interval_text = f"{interval_seconds:g}"
+        select_filter = (
+            "select=isnan(prev_selected_t)+gt("
+            f"floor((t-start_t)/{interval_text})\\,"
+            f"floor((prev_selected_t-start_t)/{interval_text})),showinfo"
+        )
 
         if width < 1 or height < 1:
             raise AirCamError("图像宽高必须大于 0")
@@ -234,10 +249,13 @@ class CameraService:
             "ffmpeg",
             "-hide_banner",
             "-loglevel",
-            "warning",
+            "info",
             "-nostdin",
+            "-copyts",
             "-f",
             "v4l2",
+            "-timestamps",
+            "abs",
             "-input_format",
             input_format,
             "-video_size",
@@ -248,11 +266,15 @@ class CameraService:
             self.device,
             "-an",
             "-vf",
-            f"fps=1/{interval_seconds:g}",
+            select_filter,
+            "-fps_mode",
+            "vfr",
             "-q:v",
             str(quality),
             "-start_number",
             str(start_number),
+            "-atomic_writing",
+            "1",
             str(output_pattern),
         ]
 
@@ -365,27 +387,34 @@ class CameraService:
     def _spawn_ffmpeg(
         self, session_dir: Path, interval: float, start_number: int
     ) -> subprocess.Popen[bytes]:
-        output_pattern = session_dir / "photo_%08d.jpg"
+        output_pattern = session_dir / "pending_%08d.jpg"
         command = self.build_ffmpeg_command(
             output_pattern, interval, start_number=start_number
         )
-        log_handle = (session_dir / "ffmpeg.log").open("ab", buffering=0)
         try:
             process = self.popen(
                 command,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=log_handle,
+                stderr=subprocess.PIPE,
                 start_new_session=True,
             )
         except OSError as exc:
             raise AirCamError(f"无法启动 ffmpeg：{exc}") from exc
-        finally:
-            log_handle.close()
+
+        reader = threading.Thread(
+            target=self._read_ffmpeg_stderr,
+            args=(process, session_dir, start_number),
+            name=f"ffmpeg-log-{process.pid}",
+            daemon=True,
+        )
+        self.ffmpeg_reader_threads[id(process)] = reader
+        reader.start()
 
         time.sleep(0.25)
         exit_code = process.poll()
         if exit_code is not None:
+            self._join_ffmpeg_reader(process)
             log_text = (session_dir / "ffmpeg.log").read_text(
                 encoding="utf-8", errors="replace"
             )
@@ -395,14 +424,82 @@ class CameraService:
         return process
 
     @staticmethod
+    def _pts_to_unix_us(pts: int, numerator: int, denominator: int) -> int:
+        if denominator <= 0:
+            raise ValueError("time base denominator must be positive")
+        scaled = pts * numerator * 1_000_000
+        if scaled >= 0:
+            return (scaled + denominator // 2) // denominator
+        return -((-scaled + denominator // 2) // denominator)
+
+    def _read_ffmpeg_stderr(
+        self,
+        process: subprocess.Popen[bytes],
+        session_dir: Path,
+        start_number: int,
+    ) -> None:
+        stream = getattr(process, "stderr", None)
+        if stream is None:
+            return
+        time_base: tuple[int, int] | None = None
+        with (session_dir / "ffmpeg.log").open("ab", buffering=0) as log_handle:
+            for raw_line in stream:
+                if isinstance(raw_line, str):
+                    line = raw_line
+                    encoded = raw_line.encode("utf-8", errors="replace")
+                else:
+                    encoded = raw_line
+                    line = raw_line.decode("utf-8", errors="replace")
+                log_handle.write(encoded)
+
+                match = SHOWINFO_TIMEBASE.search(line)
+                if match:
+                    time_base = (int(match.group(1)), int(match.group(2)))
+                    continue
+                match = SHOWINFO_FRAME.search(line)
+                if match and time_base is not None:
+                    frame_index = int(match.group(1))
+                    pts = int(match.group(2))
+                    capture_us = self._pts_to_unix_us(
+                        pts, time_base[0], time_base[1]
+                    )
+                    pending_name = (
+                        f"pending_{start_number + frame_index:08d}.jpg"
+                    )
+                    with self.lock:
+                        self.frame_timestamps_us[pending_name] = capture_us
+
+    def _join_ffmpeg_reader(
+        self, process: subprocess.Popen[bytes], timeout: float = 2.0
+    ) -> None:
+        reader = self.ffmpeg_reader_threads.pop(id(process), None)
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=timeout)
+
+    @staticmethod
     def _manifest_header() -> list[str]:
         return [
             "filename",
+            "capture_time_utc",
+            "capture_unix_us",
+            "capture_time_source",
             "file_mtime_utc",
+            "write_delay_ms",
             "size_bytes",
             "interval_seconds",
             "camera_controls_json",
         ]
+
+    @staticmethod
+    def _timed_photo_name(capture_unix_us: int, sequence: int) -> str:
+        seconds, microseconds = divmod(capture_unix_us, 1_000_000)
+        captured = datetime.fromtimestamp(seconds, timezone.utc).replace(
+            microsecond=microseconds
+        )
+        return (
+            f"photo_{captured:%Y%m%dT%H%M%S}."
+            f"{microseconds:06d}Z_{sequence:08d}.jpg"
+        )
 
     def _record_new_photos(
         self,
@@ -412,7 +509,10 @@ class CameraService:
     ) -> None:
         now = time.time()
         rows: list[list[Any]] = []
-        for photo in sorted(session_dir.glob("photo_*.jpg")):
+        candidates = sorted(
+            [*session_dir.glob("pending_*.jpg"), *session_dir.glob("photo_*.jpg")]
+        )
+        for photo in candidates:
             if photo.name in self.manifested_photos:
                 continue
             try:
@@ -427,16 +527,57 @@ class CameraService:
             # Avoid recording a file while ffmpeg may still be writing it.
             if not include_recent and now - stat.st_mtime < 0.25:
                 continue
+
+            pending_match = PENDING_PHOTO.fullmatch(photo.name)
+            if pending_match:
+                with self.lock:
+                    capture_unix_us = self.frame_timestamps_us.pop(
+                        photo.name, None
+                    )
+                if capture_unix_us is None and not include_recent:
+                    continue
+                capture_source = (
+                    "v4l2_pts_abs"
+                    if capture_unix_us is not None
+                    else "file_mtime_fallback"
+                )
+                if capture_unix_us is None:
+                    capture_unix_us = round(stat.st_mtime * 1_000_000)
+                final_name = self._timed_photo_name(
+                    capture_unix_us, int(pending_match.group(1))
+                )
+                final_path = session_dir / final_name
+                if final_path.exists():
+                    LOG.error(
+                        "refusing to overwrite existing photograph: %s",
+                        final_path,
+                    )
+                    continue
+                os.replace(photo, final_path)
+                photo = final_path
+                stat = photo.stat()
+            else:
+                capture_unix_us = round(stat.st_mtime * 1_000_000)
+                capture_source = "file_mtime_fallback"
+
+            capture_seconds = capture_unix_us / 1_000_000
+            capture_time = datetime.fromtimestamp(
+                capture_seconds, timezone.utc
+            ).isoformat(timespec="microseconds")
             rows.append(
                 [
                     photo.name,
+                    capture_time,
+                    capture_unix_us,
+                    capture_source,
                     datetime.fromtimestamp(
                         stat.st_mtime, timezone.utc
-                    ).isoformat(timespec="milliseconds"),
+                    ).isoformat(timespec="microseconds"),
+                    round((stat.st_mtime - capture_seconds) * 1000, 3),
                     stat.st_size,
                     interval,
                     json.dumps(
-                        self._controls_at(stat.st_mtime),
+                        self._controls_at(capture_seconds),
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ),
@@ -456,11 +597,17 @@ class CameraService:
     @staticmethod
     def _next_photo_number(session_dir: Path) -> int:
         highest = 0
-        for photo in session_dir.glob("photo_*.jpg"):
-            try:
-                highest = max(highest, int(photo.stem.removeprefix("photo_")))
-            except ValueError:
-                continue
+        for photo in [
+            *session_dir.glob("photo_*.jpg"),
+            *session_dir.glob("pending_*.jpg"),
+        ]:
+            match = (
+                TIMED_PHOTO.fullmatch(photo.name)
+                or LEGACY_PHOTO.fullmatch(photo.name)
+                or PENDING_PHOTO.fullmatch(photo.name)
+            )
+            if match:
+                highest = max(highest, int(match.group(1)))
         return highest + 1
 
     def start(self, interval_seconds: Any = None) -> dict[str, Any]:
@@ -500,6 +647,8 @@ class CameraService:
             session_dir.mkdir(parents=True)
             self.session_dir = session_dir
             self.manifested_photos = set()
+            self.frame_timestamps_us = {}
+            self.ffmpeg_reader_threads = {}
             self.control_history = []
             with (session_dir / "manifest.csv").open(
                 "w", encoding="utf-8", newline=""
@@ -516,6 +665,13 @@ class CameraService:
                 "camera": self.config["camera"],
                 "active_controls": dict(self.active_controls),
                 "capture": self.config["capture"],
+                "timestamping": {
+                    "source": "V4L2 absolute frame PTS",
+                    "resolution": "microseconds",
+                    "filename_format": (
+                        "photo_YYYYMMDDTHHMMSS.ffffffZ_NNNNNNNN.jpg"
+                    ),
+                },
             }
             atomic_write_json(session_dir / "session.json", metadata)
             self.status = CaptureStatus(
@@ -604,6 +760,7 @@ class CameraService:
                 time.sleep(0.25)
                 continue
 
+            self._join_ffmpeg_reader(process)
             self._record_new_photos(
                 session_dir, interval, include_recent=True
             )
