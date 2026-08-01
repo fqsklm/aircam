@@ -2,185 +2,738 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>AirCam 固定翼拍照系统</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#071018">
+  <title>AirCam 飞行拍摄控制台</title>
   <style>
-    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
-    body { max-width: 760px; margin: 0 auto; padding: 20px; background:#101418; color:#edf2f7; }
-    h1 { font-size:1.45rem; margin-bottom:4px; }
-    .muted { color:#9aa8b5; font-size:.9rem; }
-    .card { background:#192128; border:1px solid #2b3945; border-radius:14px; padding:16px; margin:14px 0; }
-    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:end; }
-    label { display:grid; gap:5px; flex:1; min-width:150px; font-size:.88rem; color:#bbc7d1; }
-    input, textarea, button { font:inherit; border-radius:8px; border:1px solid #41515f; }
-    input, textarea { background:#0f151a; color:#fff; padding:9px; }
-    button { cursor:pointer; padding:10px 15px; background:#2c78d4; color:#fff; font-weight:650; }
-    button.stop { background:#c34848; }
-    button.secondary { background:#35424d; }
-    button:disabled { opacity:.45; cursor:not-allowed; }
-    #state { font-weight:700; }
-    #state.capturing { color:#5ee27a; }
-    #state.error { color:#ff7272; }
-    #message { min-height:1.4em; color:#ffcf6a; white-space:pre-wrap; }
-    pre { overflow:auto; max-height:280px; background:#0d1216; padding:12px; border-radius:8px; }
-    img { width:100%; min-height:120px; object-fit:contain; background:#0b0f12; border-radius:8px; }
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      --bg:#071018;
+      --panel:#0e1a24;
+      --panel-2:#121f2a;
+      --line:#223544;
+      --line-strong:#365064;
+      --text:#f3f7fa;
+      --muted:#94a8b8;
+      --primary:#40a9ff;
+      --primary-strong:#1688e5;
+      --success:#54d98c;
+      --warning:#ffc857;
+      --danger:#ff6b72;
+      --radius:18px;
+      --shadow:0 20px 55px rgba(0,0,0,.25);
+    }
+    * { box-sizing:border-box; }
+    body {
+      margin:0;
+      min-height:100vh;
+      background:
+        radial-gradient(circle at 12% -10%, rgba(64,169,255,.14), transparent 35rem),
+        linear-gradient(180deg, #08131c 0%, var(--bg) 46%, #050b10 100%);
+      color:var(--text);
+    }
+    button, input, textarea, select { font:inherit; }
+    button { -webkit-tap-highlight-color:transparent; }
+    .shell { width:min(1080px, 100%); margin:0 auto; padding:28px 22px 54px; }
+    .hero {
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:18px;
+      margin-bottom:24px;
+    }
+    .brand { display:flex; align-items:center; }
+    h1 { margin:0; font-size:clamp(1.3rem, 4vw, 1.8rem); letter-spacing:-.025em; }
+    .subtitle { margin:4px 0 0; color:var(--muted); font-size:.9rem; }
+    .hero-actions { display:flex; align-items:center; gap:10px; }
+    .connection {
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      min-height:38px;
+      padding:0 12px;
+      border:1px solid var(--line);
+      border-radius:999px;
+      color:var(--muted);
+      background:rgba(14,26,36,.8);
+      font-size:.82rem;
+      white-space:nowrap;
+    }
+    .connection::before {
+      content:"";
+      width:8px;
+      height:8px;
+      border-radius:50%;
+      background:#647685;
+      box-shadow:0 0 0 4px rgba(100,118,133,.12);
+    }
+    .connection.online { color:#b9f3d2; border-color:rgba(84,217,140,.35); }
+    .connection.online::before { background:var(--success); box-shadow:0 0 0 4px rgba(84,217,140,.12); }
+    .connection.offline { color:#ffb0b4; border-color:rgba(255,107,114,.35); }
+    .connection.offline::before { background:var(--danger); box-shadow:0 0 0 4px rgba(255,107,114,.12); }
+    main { display:grid; gap:18px; }
+    .panel {
+      border:1px solid var(--line);
+      border-radius:var(--radius);
+      background:linear-gradient(160deg, rgba(18,31,42,.96), rgba(12,24,33,.96));
+      box-shadow:var(--shadow);
+      overflow:hidden;
+    }
+    .panel-body { padding:22px; }
+    .panel-head {
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:16px;
+      margin-bottom:18px;
+    }
+    .eyebrow { color:#6fbdf6; text-transform:uppercase; letter-spacing:.12em; font-size:.7rem; font-weight:800; }
+    h2 { margin:4px 0 0; font-size:1.08rem; }
+    .helper { color:var(--muted); font-size:.8rem; line-height:1.55; }
+    .state-pill {
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
+      padding:7px 11px;
+      border:1px solid var(--line-strong);
+      border-radius:999px;
+      color:#c1d0db;
+      background:#0a151d;
+      font-size:.8rem;
+      font-weight:750;
+      white-space:nowrap;
+    }
+    .state-pill::before { content:""; width:8px; height:8px; border-radius:50%; background:#8194a3; }
+    .state-pill.capturing { color:#b9f3d2; border-color:rgba(84,217,140,.35); }
+    .state-pill.capturing::before { background:var(--success); animation:pulse 1.6s infinite; }
+    .state-pill.error { color:#ffb0b4; border-color:rgba(255,107,114,.4); }
+    .state-pill.error::before { background:var(--danger); }
+    .state-pill.starting, .state-pill.recovering, .state-pill.stopping { color:#ffe5a6; border-color:rgba(255,200,87,.4); }
+    .state-pill.starting::before, .state-pill.recovering::before, .state-pill.stopping::before { background:var(--warning); }
+    @keyframes pulse { 50% { opacity:.35; transform:scale(.8); } }
+    .stats { display:grid; grid-template-columns:repeat(4, 1fr); gap:10px; margin-bottom:20px; }
+    .stat { min-width:0; padding:13px 14px; border:1px solid var(--line); border-radius:13px; background:rgba(6,15,22,.48); }
+    .stat-label { display:block; color:var(--muted); font-size:.72rem; margin-bottom:5px; }
+    .stat-value { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:760; font-size:.92rem; }
+    .capture-grid { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:18px; align-items:end; }
+    .field-label { display:block; margin-bottom:8px; color:#c4d1da; font-size:.86rem; font-weight:650; }
+    .field-meta { display:flex; justify-content:space-between; gap:12px; margin-top:7px; color:var(--muted); font-size:.76rem; }
+    .stepper { display:grid; grid-template-columns:46px minmax(120px, 1fr) 46px; }
+    .stepper button, .stepper input { height:48px; border:1px solid var(--line-strong); background:#071119; color:var(--text); }
+    .stepper button { cursor:pointer; color:#b9d7ea; font-size:1.35rem; font-weight:500; }
+    .stepper button:first-child { border-radius:12px 0 0 12px; }
+    .stepper button:last-child { border-radius:0 12px 12px 0; }
+    .stepper input { width:100%; border-left:0; border-right:0; border-radius:0; padding:0 12px; text-align:center; font-variant-numeric:tabular-nums; font-weight:720; }
+    input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { appearance:none; margin:0; }
+    input[type=number] { -moz-appearance:textfield; }
+    input, textarea, select {
+      width:100%;
+      border:1px solid var(--line-strong);
+      border-radius:11px;
+      padding:11px 12px;
+      background:#071119;
+      color:var(--text);
+      outline:none;
+      transition:border-color .18s, box-shadow .18s;
+    }
+    input:focus, textarea:focus, select:focus { border-color:var(--primary); box-shadow:0 0 0 3px rgba(64,169,255,.13); }
+    input:disabled, textarea:disabled, select:disabled { opacity:.48; cursor:not-allowed; }
+    .presets { display:flex; flex-wrap:wrap; gap:7px; margin-top:11px; }
+    .chip {
+      min-height:34px;
+      padding:0 11px;
+      border:1px solid var(--line-strong);
+      border-radius:999px;
+      background:#0b1821;
+      color:#aebdca;
+      cursor:pointer;
+      font-size:.76rem;
+      font-weight:650;
+    }
+    .chip:hover, .chip.selected { color:#dff2ff; border-color:rgba(64,169,255,.62); background:rgba(64,169,255,.13); }
+    .capture-actions { display:grid; grid-template-columns:1fr 1fr; gap:10px; min-width:286px; }
+    .button {
+      min-height:48px;
+      padding:0 17px;
+      border:1px solid transparent;
+      border-radius:12px;
+      background:linear-gradient(180deg, #41aaff, var(--primary-strong));
+      color:white;
+      cursor:pointer;
+      font-weight:760;
+      box-shadow:0 8px 18px rgba(22,136,229,.2);
+      transition:transform .15s, filter .15s, border-color .15s;
+    }
+    .button:hover:not(:disabled) { filter:brightness(1.08); transform:translateY(-1px); }
+    .button:active:not(:disabled), .chip:active:not(:disabled), .icon-button:active:not(:disabled), .stepper button:active:not(:disabled) { transform:translateY(1px) scale(.98); }
+    .button.secondary, .icon-button { background:#182936; border-color:var(--line-strong); color:#d3e0e8; box-shadow:none; }
+    .button.danger { background:rgba(255,107,114,.14); border-color:rgba(255,107,114,.46); color:#ffb0b4; box-shadow:none; }
+    .button:disabled, .chip:disabled, .icon-button:disabled, .stepper button:disabled { opacity:.38; cursor:not-allowed; transform:none; }
+    .button.busy::before, .icon-button.busy::before {
+      content:"";
+      display:inline-block;
+      width:13px;
+      height:13px;
+      margin-right:8px;
+      vertical-align:-2px;
+      border:2px solid currentColor;
+      border-right-color:transparent;
+      border-radius:50%;
+      animation:spin .7s linear infinite;
+    }
+    .button.confirmed, .icon-button.confirmed { border-color:rgba(84,217,140,.55); color:#c4f8db; background:rgba(84,217,140,.14); }
+    .button.failed, .icon-button.failed { border-color:rgba(255,107,114,.55); color:#ffc0c3; background:rgba(255,107,114,.14); }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    .icon-button {
+      min-width:42px;
+      min-height:40px;
+      padding:0 12px;
+      border:1px solid var(--line-strong);
+      border-radius:11px;
+      cursor:pointer;
+      font-size:.82rem;
+      font-weight:700;
+    }
+    .form-grid { display:grid; grid-template-columns:1fr 1.35fr; gap:16px; }
+    .range-row { display:grid; grid-template-columns:minmax(120px, 1fr) 100px; gap:10px; align-items:center; }
+    input[type=range] { padding:0; border:0; box-shadow:none; accent-color:var(--primary); background:transparent; }
+    .exposure-block.disabled { opacity:.46; }
+    .exposure-block.disabled .chip { pointer-events:none; }
+    .panel-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:18px; }
+    .alert {
+      display:none;
+      margin-bottom:16px;
+      padding:11px 13px;
+      border:1px solid rgba(255,107,114,.38);
+      border-radius:11px;
+      background:rgba(255,107,114,.1);
+      color:#ffb7ba;
+      font-size:.82rem;
+      white-space:pre-wrap;
+    }
+    .alert.visible { display:block; }
+    .preview-frame {
+      position:relative;
+      display:grid;
+      place-items:center;
+      min-height:260px;
+      border:1px dashed var(--line-strong);
+      border-radius:14px;
+      overflow:hidden;
+      background:#050b10;
+    }
+    .preview-frame img { display:none; width:100%; max-height:560px; object-fit:contain; }
+    .preview-frame.has-image img { display:block; }
+    .empty-preview { text-align:center; color:var(--muted); padding:35px; }
+    .preview-frame.has-image .empty-preview { display:none; }
+    .empty-icon { display:block; margin:0 auto 10px; font-size:2rem; opacity:.6; }
+    details.panel > summary {
+      list-style:none;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      padding:18px 22px;
+      cursor:pointer;
+      font-weight:720;
+    }
+    details.panel > summary::-webkit-details-marker { display:none; }
+    details.panel > summary::after { content:"＋"; color:var(--muted); font-size:1.2rem; }
+    details[open].panel > summary::after { content:"−"; }
+    details.panel[open] > summary { border-bottom:1px solid var(--line); }
+    .settings-grid { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:end; }
+    textarea { resize:vertical; min-height:104px; font-family:ui-monospace, SFMono-Regular, Consolas, monospace; font-size:.8rem; line-height:1.5; }
+    pre {
+      margin:10px 0 0;
+      max-height:270px;
+      overflow:auto;
+      padding:13px;
+      border:1px solid var(--line);
+      border-radius:11px;
+      background:#050b10;
+      color:#bad1e0;
+      font:12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace;
+      white-space:pre-wrap;
+    }
+    .advanced-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:18px; }
+    .advanced-grid .full { grid-column:1 / -1; }
+    .toast-stack {
+      position:fixed;
+      z-index:30;
+      top:18px;
+      right:18px;
+      display:grid;
+      gap:8px;
+      width:min(360px, calc(100vw - 28px));
+      pointer-events:none;
+    }
+    .toast {
+      display:flex;
+      align-items:flex-start;
+      gap:10px;
+      padding:13px 14px;
+      border:1px solid var(--line-strong);
+      border-radius:12px;
+      background:rgba(12,25,34,.96);
+      box-shadow:0 14px 40px rgba(0,0,0,.38);
+      color:#dce8ef;
+      font-size:.84rem;
+      animation:toast-in .2s ease-out;
+    }
+    .toast::before { content:"✓"; color:var(--success); font-weight:900; }
+    .toast.error::before { content:"!"; color:var(--danger); }
+    @keyframes toast-in { from { opacity:0; transform:translateY(-8px); } }
+    footer { margin-top:18px; text-align:center; color:#647987; font-size:.72rem; }
+    @media (max-width:760px) {
+      .shell { padding:20px 14px 38px; }
+      .hero { align-items:flex-start; }
+      .subtitle { display:none; }
+      .connection span { display:none; }
+      .stats { grid-template-columns:1fr 1fr; }
+      .capture-grid { grid-template-columns:1fr; }
+      .capture-actions { min-width:0; }
+      .form-grid, .advanced-grid { grid-template-columns:1fr; }
+      .advanced-grid .full { grid-column:auto; }
+      .panel-body { padding:18px; }
+    }
+    @media (max-width:430px) {
+      .hero-actions { gap:6px; }
+      .connection { padding:0 10px; }
+      .stats { gap:8px; }
+      .stat { padding:11px; }
+      .capture-actions { grid-template-columns:1fr; }
+      .settings-grid { grid-template-columns:1fr; }
+      .panel-actions { display:grid; }
+      .range-row { grid-template-columns:1fr 84px; }
+    }
   </style>
 </head>
 <body>
-  <h1>AirCam 固定翼拍照系统</h1>
-  <div class="muted">同一局域网内控制；飞行时建议使用遥控接收机 GPIO 触发。</div>
+  <div class="toast-stack" id="toastStack" aria-live="polite" aria-atomic="true"></div>
+  <div class="shell">
+    <header class="hero">
+      <div class="brand">
+        <div>
+          <h1>AirCam 飞行拍摄控制台</h1>
+          <p class="subtitle">树莓派固定翼连续拍照与相机参数控制</p>
+        </div>
+      </div>
+      <div class="hero-actions">
+        <div id="connectionBadge" class="connection"><span>正在连接</span></div>
+        <button id="refreshBtn" class="icon-button" type="button">刷新</button>
+      </div>
+    </header>
 
-  <section class="card">
-    <div class="row">
-      <label>访问令牌<input id="token" type="password" autocomplete="current-password"></label>
-      <button class="secondary" onclick="saveToken()">保存令牌</button>
-      <button class="secondary" onclick="refresh()">刷新</button>
-    </div>
-  </section>
+    <main>
+      <section class="panel" aria-labelledby="missionTitle">
+        <div class="panel-body">
+          <div class="panel-head">
+            <div>
+              <div class="eyebrow">Mission control</div>
+              <h2 id="missionTitle">拍摄任务</h2>
+            </div>
+            <div id="statePill" class="state-pill">未知</div>
+          </div>
+          <div id="systemAlert" class="alert" role="alert"></div>
+          <div class="stats">
+            <div class="stat"><span class="stat-label">任务编号</span><span id="sessionValue" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">照片数量</span><span id="photoCount" class="stat-value">0</span></div>
+            <div class="stat"><span class="stat-label">恢复次数</span><span id="restartCount" class="stat-value">0</span></div>
+            <div class="stat"><span class="stat-label">剩余空间</span><span id="diskFree" class="stat-value">—</span></div>
+          </div>
 
-  <section class="card">
-    <div>状态：<span id="state">未知</span></div>
-    <div id="details" class="muted">尚未连接</div>
-    <div class="row" style="margin-top:12px">
-      <label>拍摄间隔（秒）<input id="interval" type="number" min=".0334" max="3600" step=".0001" value="1"></label>
-      <button id="start" onclick="startCapture()">开始拍照</button>
-      <button id="stop" class="stop" onclick="stopCapture()">结束拍照</button>
-    </div>
-  </section>
+          <div class="capture-grid">
+            <div>
+              <label class="field-label" for="interval">拍摄间隔</label>
+              <div class="stepper">
+                <button id="intervalDown" type="button" aria-label="减小拍摄间隔">−</button>
+                <input id="interval" type="number" inputmode="decimal" min="0.0334" max="3600" step="0.1" value="1" aria-describedby="intervalMeta">
+                <button id="intervalUp" type="button" aria-label="增大拍摄间隔">＋</button>
+              </div>
+              <div id="intervalMeta" class="field-meta">
+                <span>最小 0.0334 秒（约 30 张/秒）</span>
+                <span id="intervalRate">1 张/秒</span>
+              </div>
+              <div class="presets" aria-label="常用拍摄间隔">
+                <button class="chip interval-preset" type="button" data-interval="0.0334">最快 · 0.0334s</button>
+                <button class="chip interval-preset" type="button" data-interval="0.05">0.05s</button>
+                <button class="chip interval-preset" type="button" data-interval="0.1">0.1s</button>
+                <button class="chip interval-preset" type="button" data-interval="0.2">0.2s</button>
+                <button class="chip interval-preset" type="button" data-interval="0.5">0.5s</button>
+                <button class="chip interval-preset" type="button" data-interval="1">1s</button>
+                <button class="chip interval-preset" type="button" data-interval="2">2s</button>
+                <button class="chip interval-preset" type="button" data-interval="5">5s</button>
+              </div>
+            </div>
+            <div class="capture-actions">
+              <button id="startBtn" class="button" type="button">开始拍照</button>
+              <button id="stopBtn" class="button danger" type="button" disabled>结束拍照</button>
+            </div>
+          </div>
+        </div>
+      </section>
 
-  <section class="card">
-    <div class="row">
-      <label>曝光模式 auto_exposure（1 手动 / 3 自动）<input id="auto_exposure" type="number" min="1" max="3" step="2" value="3"></label>
-      <label>曝光时间 exposure_time_absolute（3–2047，单位 0.1 ms）<input id="exposure_time_absolute" type="number" min="3" max="2047" value="100"></label>
-      <button onclick="setExposure()">应用参数</button>
-    </div>
-    <div class="muted" style="margin-top:9px">数值范围由摄像头决定。先点击“读取支持项”确认；很多 UVC 摄像头中 1 表示手动曝光。</div>
-    <div class="row" style="margin-top:10px">
-      <button class="secondary" onclick="loadControls()">读取支持项</button>
-    </div>
-    <pre id="controls" hidden></pre>
-    <label style="margin-top:12px">任意V4L2参数（JSON对象）
-      <textarea id="customControls" rows="4">{"white_balance_automatic":0,"white_balance_temperature":4500}</textarea>
-    </label>
-    <div class="row" style="margin-top:10px">
-      <button onclick="setCustomControls()">应用自定义参数</button>
-    </div>
-    <div class="muted" style="margin-top:10px">当前生效参数：</div>
-    <pre id="currentControls">{}</pre>
-  </section>
+      <section class="panel" aria-labelledby="cameraTitle">
+        <div class="panel-body">
+          <div class="panel-head">
+            <div>
+              <div class="eyebrow">Camera</div>
+              <h2 id="cameraTitle">曝光与清晰度</h2>
+            </div>
+            <span class="helper">数值由摄像头硬件决定</span>
+          </div>
+          <div class="form-grid">
+            <label>
+              <span class="field-label">曝光模式</span>
+              <select id="auto_exposure">
+                <option value="3">自动曝光</option>
+                <option value="1">手动曝光</option>
+              </select>
+              <span class="helper">高速飞行建议使用手动曝光并逐步缩短时间。</span>
+            </label>
+            <div id="exposureBlock" class="exposure-block disabled">
+              <label class="field-label" for="exposure_time_absolute">曝光时间 · <span id="exposureMs">10.0 ms</span></label>
+              <div class="range-row">
+                <input id="exposureRange" type="range" min="3" max="2047" step="1" value="100" disabled>
+                <input id="exposure_time_absolute" type="number" inputmode="numeric" min="3" max="2047" step="10" value="100" disabled>
+              </div>
+              <div class="presets" aria-label="常用曝光时间">
+                <button class="chip exposure-preset" type="button" data-exposure="3">0.3ms</button>
+                <button class="chip exposure-preset" type="button" data-exposure="10">1ms</button>
+                <button class="chip exposure-preset" type="button" data-exposure="30">3ms</button>
+                <button class="chip exposure-preset" type="button" data-exposure="100">10ms</button>
+                <button class="chip exposure-preset" type="button" data-exposure="300">30ms</button>
+              </div>
+            </div>
+          </div>
+          <div class="panel-actions">
+            <button id="loadControlsBtn" class="button secondary" type="button">读取摄像头支持项</button>
+            <button id="applyExposureBtn" class="button" type="button">应用曝光参数</button>
+          </div>
+          <pre id="controls" hidden></pre>
+        </div>
+      </section>
 
-  <section class="card">
-    <div class="row"><button class="secondary" onclick="loadLatest()">查看最新照片</button></div>
-    <img id="latest" alt="尚无预览">
-  </section>
+      <section class="panel" aria-labelledby="previewTitle">
+        <div class="panel-body">
+          <div class="panel-head">
+            <div>
+              <div class="eyebrow">Preview</div>
+              <h2 id="previewTitle">最新照片</h2>
+            </div>
+            <button id="latestBtn" class="button secondary" type="button">加载最新照片</button>
+          </div>
+          <div id="previewFrame" class="preview-frame">
+            <div class="empty-preview"><span class="empty-icon" aria-hidden="true">▧</span>拍摄完成后，在这里加载最近一张照片</div>
+            <img id="latest" alt="最新拍摄照片">
+          </div>
+        </div>
+      </section>
 
-  <div id="message"></div>
+      <details class="panel" id="settingsPanel">
+        <summary>连接与高级设置 <span class="helper">令牌、V4L2 自定义参数</span></summary>
+        <div class="panel-body">
+          <div class="settings-grid">
+            <label>
+              <span class="field-label">访问令牌</span>
+              <input id="token" type="password" autocomplete="current-password" placeholder="输入 AirCam 访问令牌">
+            </label>
+            <button id="saveTokenBtn" class="button secondary" type="button">保存令牌</button>
+          </div>
+          <div class="advanced-grid">
+            <label>
+              <span class="field-label">任意 V4L2 参数（JSON 对象）</span>
+              <textarea id="customControls" rows="5">{"white_balance_automatic":0,"white_balance_temperature":4500}</textarea>
+            </label>
+            <div>
+              <span class="field-label">当前生效参数</span>
+              <pre id="currentControls">{}</pre>
+            </div>
+            <div class="full panel-actions">
+              <button id="applyCustomBtn" class="button" type="button">应用自定义参数</button>
+            </div>
+          </div>
+        </div>
+      </details>
+    </main>
+    <footer>照片时间使用 UTC 微秒命名 · 飞行前请完成地面测试</footer>
+  </div>
 
 <script>
 const $ = id => document.getElementById(id);
+const MIN_INTERVAL = 0.0334;
+const MAX_INTERVAL = 3600;
+const INTERVAL_STEPS = [0.0334, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600];
+const stateLabels = {
+  idle:"待机", starting:"启动中", capturing:"拍摄中", recovering:"恢复中",
+  stopping:"停止中", error:"错误"
+};
+let latestStatus = null;
+
 $("token").value = localStorage.getItem("aircamToken") || "";
-function saveToken() {
-  localStorage.setItem("aircamToken", $("token").value);
-  message("令牌已保存在本浏览器");
-  refresh();
-}
+
 function headers(json=true) {
-  const h = {"X-AirCam-Token": $("token").value};
-  if (json) h["Content-Type"] = "application/json";
-  return h;
+  const value = $("token").value.trim();
+  const result = {"X-AirCam-Token": value};
+  if (json) result["Content-Type"] = "application/json";
+  return result;
 }
-function message(text) { $("message").textContent = text || ""; }
-async function api(path, options={}) {
-  const response = await fetch(path, {...options, headers:headers(true)});
-  const body = await response.json();
-  if (!response.ok || !body.ok) throw new Error(body.error || `HTTP ${response.status}`);
-  return body;
+
+function showToast(text, type="success") {
+  const toast = document.createElement("div");
+  toast.className = `toast ${type}`;
+  toast.textContent = text;
+  $("toastStack").appendChild(toast);
+  window.setTimeout(() => toast.remove(), type === "error" ? 5200 : 3200);
 }
-function formatBytes(n) {
-  if (!Number.isFinite(n)) return "?";
-  for (const u of ["B","KB","MB","GB","TB"]) {
-    if (n < 1024 || u === "TB") return `${n.toFixed(u==="B"?0:1)} ${u}`;
-    n /= 1024;
+
+function delay(ms) { return new Promise(resolve => window.setTimeout(resolve, ms)); }
+
+async function runButton(button, busyText, confirmedText, task) {
+  if (button.dataset.busy === "true") return;
+  const originalText = button.textContent;
+  button.dataset.busy = "true";
+  button.disabled = true;
+  button.classList.add("busy");
+  button.textContent = busyText;
+  try {
+    const result = await task();
+    button.classList.remove("busy");
+    button.classList.add("confirmed");
+    button.textContent = `✓ ${confirmedText}`;
+    showToast(confirmedText);
+    await delay(600);
+    return result;
+  } catch (error) {
+    button.classList.remove("busy");
+    button.classList.add("failed");
+    button.textContent = "× 操作失败";
+    showToast(error.message || String(error), "error");
+    await delay(900);
+    throw error;
+  } finally {
+    button.dataset.busy = "false";
+    button.classList.remove("busy", "confirmed", "failed");
+    button.textContent = originalText;
+    applyStatus(latestStatus);
   }
 }
-async function refresh() {
+
+async function api(path, options={}) {
+  const response = await fetch(path, {...options, headers:headers(true)});
+  let body = null;
+  try { body = await response.json(); } catch (_) { /* handled below */ }
+  if (!response.ok || !body || !body.ok) {
+    throw new Error((body && body.error) || `请求失败（HTTP ${response.status}）`);
+  }
+  return body;
+}
+
+function formatBytes(value) {
+  let number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  for (const unit of ["B", "KB", "MB", "GB", "TB"]) {
+    if (number < 1024 || unit === "TB") return `${number.toFixed(unit === "B" ? 0 : 1)} ${unit}`;
+    number /= 1024;
+  }
+}
+
+function setConnection(online) {
+  const badge = $("connectionBadge");
+  badge.className = `connection ${online ? "online" : "offline"}`;
+  badge.innerHTML = `<span>${online ? "树莓派在线" : "连接失败"}</span>`;
+}
+
+function applyStatus(status) {
+  if (!status) return;
+  latestStatus = status;
+  const state = status.state || "未知";
+  const pill = $("statePill");
+  pill.textContent = stateLabels[state] || state;
+  pill.className = `state-pill ${state}`;
+  $("sessionValue").textContent = status.session || "—";
+  $("photoCount").textContent = status.photo_count ?? 0;
+  $("restartCount").textContent = status.restart_count ?? 0;
+  $("diskFree").textContent = formatBytes(status.disk && status.disk.free_bytes);
+  $("currentControls").textContent = JSON.stringify(status.active_controls || {}, null, 2);
+
+  const alert = $("systemAlert");
+  alert.textContent = status.last_error || "";
+  alert.classList.toggle("visible", Boolean(status.last_error));
+
+  const transitional = ["starting", "recovering", "stopping"].includes(state);
+  const capturing = state === "capturing" || state === "recovering" || state === "starting";
+  $("startBtn").disabled = capturing || transitional || $("startBtn").dataset.busy === "true";
+  $("stopBtn").disabled = !capturing || $("stopBtn").dataset.busy === "true";
+  for (const element of [$("interval"), $("intervalDown"), $("intervalUp"), ...document.querySelectorAll(".interval-preset")]) {
+    element.disabled = capturing;
+  }
+}
+
+async function refreshStatus({quiet=false}={}) {
   try {
     const body = await api("/api/status");
-    const s = body.status;
-    $("state").textContent = s.state;
-    $("state").className = s.state;
-    $("details").textContent =
-      `任务：${s.session || "-"}　照片：${s.photo_count}　恢复：${s.restart_count || 0} 次　剩余：${formatBytes(s.disk.free_bytes)}`;
-    $("currentControls").textContent = JSON.stringify(s.active_controls || {}, null, 2);
-    $("start").disabled = s.state === "capturing";
-    $("stop").disabled = s.state !== "capturing";
-    message(s.last_error || "");
-  } catch (e) { message(e.message); }
+    applyStatus(body.status);
+    setConnection(true);
+    return body.status;
+  } catch (error) {
+    setConnection(false);
+    if (!quiet) showToast(error.message || String(error), "error");
+    throw error;
+  }
 }
+
+function readInterval() {
+  const value = Number($("interval").value);
+  if (!Number.isFinite(value) || value < MIN_INTERVAL || value > MAX_INTERVAL) {
+    throw new Error(`拍摄间隔必须在 ${MIN_INTERVAL} 到 ${MAX_INTERVAL} 秒之间`);
+  }
+  return value;
+}
+
+function formatInterval(value) {
+  return Number(value.toFixed(4)).toString();
+}
+
+function updateIntervalUi() {
+  const value = Number($("interval").value);
+  const valid = Number.isFinite(value) && value >= MIN_INTERVAL && value <= MAX_INTERVAL;
+  $("intervalRate").textContent = valid ? `约 ${(1 / value).toFixed(value < .1 ? 1 : 2)} 张/秒` : "数值无效";
+  document.querySelectorAll(".interval-preset").forEach(button => {
+    button.classList.toggle("selected", valid && Math.abs(Number(button.dataset.interval) - value) < 0.00001);
+  });
+}
+
+function setIntervalValue(value) {
+  $("interval").value = formatInterval(Math.min(MAX_INTERVAL, Math.max(MIN_INTERVAL, Number(value))));
+  updateIntervalUi();
+}
+
+function adjustInterval(direction) {
+  const current = Number($("interval").value);
+  if (!Number.isFinite(current)) return setIntervalValue(1);
+  if (direction < 0) {
+    const lower = INTERVAL_STEPS.filter(value => value < current - 0.000001);
+    setIntervalValue(lower.length ? lower[lower.length - 1] : MIN_INTERVAL);
+  } else {
+    const higher = INTERVAL_STEPS.find(value => value > current + 0.000001);
+    setIntervalValue(higher ?? MAX_INTERVAL);
+  }
+}
+
+function updateExposureUi() {
+  const manual = $("auto_exposure").value === "1";
+  const value = Math.min(2047, Math.max(3, Number($("exposure_time_absolute").value) || 3));
+  $("exposure_time_absolute").value = String(Math.round(value));
+  $("exposureRange").value = String(Math.round(value));
+  $("exposureMs").textContent = `${(value * .1).toFixed(1)} ms`;
+  $("exposureBlock").classList.toggle("disabled", !manual);
+  $("exposureRange").disabled = !manual;
+  $("exposure_time_absolute").disabled = !manual;
+  document.querySelectorAll(".exposure-preset").forEach(button => {
+    button.disabled = !manual;
+    button.classList.toggle("selected", manual && Number(button.dataset.exposure) === value);
+  });
+}
+
 async function startCapture() {
-  try {
-    await api("/api/start", {method:"POST", body:JSON.stringify({
-      interval_seconds:Number($("interval").value)
-    })});
-    message("拍照已开始"); await refresh();
-  } catch (e) { message(e.message); }
+  const interval = readInterval();
+  await api("/api/start", {method:"POST", body:JSON.stringify({interval_seconds:interval})});
+  await refreshStatus({quiet:true});
 }
+
 async function stopCapture() {
-  try {
-    await api("/api/stop", {method:"POST", body:"{}"});
-    message("拍照已结束，文件已关闭"); await refresh();
-  } catch (e) { message(e.message); }
+  await api("/api/stop", {method:"POST", body:"{}"});
+  await refreshStatus({quiet:true});
 }
-async function setExposure() {
-  try {
-    const controls = {
-      auto_exposure:Number($("auto_exposure").value)
-    };
-    if (controls.auto_exposure === 1) {
-      controls.exposure_time_absolute =
-        Number($("exposure_time_absolute").value);
-    }
-    await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
-    message("相机参数已应用");
-  } catch (e) { message(e.message); }
+
+async function applyExposure() {
+  const controls = {auto_exposure:Number($("auto_exposure").value)};
+  if (controls.auto_exposure === 1) {
+    controls.exposure_time_absolute = Number($("exposure_time_absolute").value);
+  }
+  await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
+  await refreshStatus({quiet:true});
 }
-async function setCustomControls() {
-  try {
-    const controls = JSON.parse($("customControls").value);
-    if (!controls || Array.isArray(controls) || typeof controls !== "object") {
-      throw new Error("参数必须是JSON对象");
-    }
-    for (const [name, value] of Object.entries(controls)) {
-      if (!Number.isInteger(value)) throw new Error(`${name} 的值必须是整数`);
-    }
-    await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
-    message("自定义相机参数已应用");
-    await refresh();
-  } catch (e) { message(e.message); }
+
+async function applyCustomControls() {
+  const controls = JSON.parse($("customControls").value);
+  if (!controls || Array.isArray(controls) || typeof controls !== "object") {
+    throw new Error("参数必须是 JSON 对象");
+  }
+  for (const [name, value] of Object.entries(controls)) {
+    if (!Number.isInteger(value)) throw new Error(`${name} 的值必须是整数`);
+  }
+  await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
+  await refreshStatus({quiet:true});
 }
+
 async function loadControls() {
-  try {
-    const body = await api("/api/controls");
-    $("controls").hidden = false; $("controls").textContent = body.raw;
-    message("");
-  } catch (e) { message(e.message); }
+  const body = await api("/api/controls");
+  $("controls").hidden = false;
+  $("controls").textContent = body.raw;
 }
+
 async function loadLatest() {
-  try {
-    const response = await fetch("/api/latest", {headers:headers(false)});
-    if (!response.ok) {
-      const body = await response.json(); throw new Error(body.error || "读取失败");
-    }
-    const blob = await response.blob();
-    const old = $("latest").dataset.url;
-    if (old) URL.revokeObjectURL(old);
-    const url = URL.createObjectURL(blob);
-    $("latest").dataset.url = url; $("latest").src = url;
-    message("");
-  } catch (e) { message(e.message); }
+  const response = await fetch("/api/latest", {headers:headers(false)});
+  if (!response.ok) {
+    let body = null;
+    try { body = await response.json(); } catch (_) { /* handled below */ }
+    throw new Error((body && body.error) || "读取最新照片失败");
+  }
+  const blob = await response.blob();
+  const oldUrl = $("latest").dataset.url;
+  if (oldUrl) URL.revokeObjectURL(oldUrl);
+  const url = URL.createObjectURL(blob);
+  $("latest").dataset.url = url;
+  $("latest").src = url;
+  $("previewFrame").classList.add("has-image");
 }
-refresh();
-setInterval(refresh, 3000);
+
+$("interval").addEventListener("input", updateIntervalUi);
+$("interval").addEventListener("change", () => {
+  try { setIntervalValue(readInterval()); } catch (error) { showToast(error.message, "error"); }
+});
+$("intervalDown").addEventListener("click", () => adjustInterval(-1));
+$("intervalUp").addEventListener("click", () => adjustInterval(1));
+document.querySelectorAll(".interval-preset").forEach(button => {
+  button.addEventListener("click", () => setIntervalValue(Number(button.dataset.interval)));
+});
+
+$("auto_exposure").addEventListener("change", updateExposureUi);
+$("exposureRange").addEventListener("input", () => {
+  $("exposure_time_absolute").value = $("exposureRange").value;
+  updateExposureUi();
+});
+$("exposure_time_absolute").addEventListener("input", updateExposureUi);
+document.querySelectorAll(".exposure-preset").forEach(button => {
+  button.addEventListener("click", () => {
+    $("exposure_time_absolute").value = button.dataset.exposure;
+    updateExposureUi();
+  });
+});
+
+$("refreshBtn").addEventListener("click", event => runButton(event.currentTarget, "刷新中", "状态已刷新", () => refreshStatus({quiet:true})).catch(() => {}));
+$("startBtn").addEventListener("click", event => runButton(event.currentTarget, "启动中", "拍照已开始", startCapture).catch(() => {}));
+$("stopBtn").addEventListener("click", event => runButton(event.currentTarget, "停止中", "拍照已结束，文件已安全关闭", stopCapture).catch(() => {}));
+$("applyExposureBtn").addEventListener("click", event => runButton(event.currentTarget, "应用中", "曝光参数已应用", applyExposure).catch(() => {}));
+$("loadControlsBtn").addEventListener("click", event => runButton(event.currentTarget, "读取中", "摄像头支持项已读取", loadControls).catch(() => {}));
+$("applyCustomBtn").addEventListener("click", event => runButton(event.currentTarget, "应用中", "自定义参数已应用", applyCustomControls).catch(() => {}));
+$("latestBtn").addEventListener("click", event => runButton(event.currentTarget, "加载中", "最新照片已加载", loadLatest).catch(() => {}));
+$("saveTokenBtn").addEventListener("click", event => runButton(event.currentTarget, "保存中", "令牌已保存在本浏览器", async () => {
+  localStorage.setItem("aircamToken", $("token").value.trim());
+  await refreshStatus({quiet:true});
+}).catch(() => {}));
+
+updateIntervalUi();
+updateExposureUi();
+refreshStatus().catch(() => {
+  if (!$("token").value) $("settingsPanel").open = true;
+});
+window.setInterval(() => {
+  if (!document.hidden) refreshStatus({quiet:true}).catch(() => {});
+}, 3000);
 </script>
 </body>
 </html>

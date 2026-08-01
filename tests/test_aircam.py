@@ -400,6 +400,45 @@ class AirCamTests(unittest.TestCase):
         self.assertIn("WantedBy=multi-user.target", unit)
         self.assertIn("ExecStart=/usr/bin/python3 /home/pi/AirCam/aircam.py", unit)
 
+    def test_web_ui_exposes_interval_floor_and_action_feedback(self):
+        page = (
+            Path(__file__).resolve().parents[1] / "web" / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn('min="0.0334"', page)
+        self.assertIn('data-interval="0.0334"', page)
+        self.assertIn("最小 0.0334 秒", page)
+        self.assertIn("function adjustInterval", page)
+        self.assertIn("function runButton", page)
+        self.assertIn('aria-live="polite"', page)
+        self.assertNotIn('class="brand-mark"', page)
+        self.assertNotIn("onclick=", page)
+        for button_id in (
+            "refreshBtn",
+            "startBtn",
+            "stopBtn",
+            "applyExposureBtn",
+            "loadControlsBtn",
+            "applyCustomBtn",
+            "latestBtn",
+            "saveTokenBtn",
+        ):
+            self.assertIn(f'$("{button_id}").addEventListener', page)
+
+    def test_readme_documents_every_config_parameter(self):
+        root = Path(__file__).resolve().parents[1]
+        example = json.loads(
+            (root / "config.example.json").read_text(encoding="utf-8")
+        )
+        readme = (root / "README.zh-CN.md").read_text(encoding="utf-8")
+        for section, values in example.items():
+            self.assertIn(f"`{section}`", readme)
+            for parameter in values:
+                self.assertIn(
+                    f"`{parameter}`",
+                    readme,
+                    f"README 未说明 {section}.{parameter}",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
