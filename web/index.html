@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AirCam 固定翼拍照系统</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 760px; margin: 0 auto; padding: 20px; background:#101418; color:#edf2f7; }
+    h1 { font-size:1.45rem; margin-bottom:4px; }
+    .muted { color:#9aa8b5; font-size:.9rem; }
+    .card { background:#192128; border:1px solid #2b3945; border-radius:14px; padding:16px; margin:14px 0; }
+    .row { display:flex; flex-wrap:wrap; gap:10px; align-items:end; }
+    label { display:grid; gap:5px; flex:1; min-width:150px; font-size:.88rem; color:#bbc7d1; }
+    input, textarea, button { font:inherit; border-radius:8px; border:1px solid #41515f; }
+    input, textarea { background:#0f151a; color:#fff; padding:9px; }
+    button { cursor:pointer; padding:10px 15px; background:#2c78d4; color:#fff; font-weight:650; }
+    button.stop { background:#c34848; }
+    button.secondary { background:#35424d; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    #state { font-weight:700; }
+    #state.capturing { color:#5ee27a; }
+    #state.error { color:#ff7272; }
+    #message { min-height:1.4em; color:#ffcf6a; white-space:pre-wrap; }
+    pre { overflow:auto; max-height:280px; background:#0d1216; padding:12px; border-radius:8px; }
+    img { width:100%; min-height:120px; object-fit:contain; background:#0b0f12; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <h1>AirCam 固定翼拍照系统</h1>
+  <div class="muted">同一局域网内控制；飞行时建议使用遥控接收机 GPIO 触发。</div>
+
+  <section class="card">
+    <div class="row">
+      <label>访问令牌<input id="token" type="password" autocomplete="current-password"></label>
+      <button class="secondary" onclick="saveToken()">保存令牌</button>
+      <button class="secondary" onclick="refresh()">刷新</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div>状态：<span id="state">未知</span></div>
+    <div id="details" class="muted">尚未连接</div>
+    <div class="row" style="margin-top:12px">
+      <label>拍摄间隔（秒）<input id="interval" type="number" min=".0334" max="3600" step=".0001" value="1"></label>
+      <button id="start" onclick="startCapture()">开始拍照</button>
+      <button id="stop" class="stop" onclick="stopCapture()">结束拍照</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="row">
+      <label>曝光模式 auto_exposure（1 手动 / 3 自动）<input id="auto_exposure" type="number" min="1" max="3" step="2" value="3"></label>
+      <label>曝光时间 exposure_time_absolute（3–2047，单位 0.1 ms）<input id="exposure_time_absolute" type="number" min="3" max="2047" value="100"></label>
+      <button onclick="setExposure()">应用参数</button>
+    </div>
+    <div class="muted" style="margin-top:9px">数值范围由摄像头决定。先点击“读取支持项”确认；很多 UVC 摄像头中 1 表示手动曝光。</div>
+    <div class="row" style="margin-top:10px">
+      <button class="secondary" onclick="loadControls()">读取支持项</button>
+    </div>
+    <pre id="controls" hidden></pre>
+    <label style="margin-top:12px">任意V4L2参数（JSON对象）
+      <textarea id="customControls" rows="4">{"white_balance_automatic":0,"white_balance_temperature":4500}</textarea>
+    </label>
+    <div class="row" style="margin-top:10px">
+      <button onclick="setCustomControls()">应用自定义参数</button>
+    </div>
+    <div class="muted" style="margin-top:10px">当前生效参数：</div>
+    <pre id="currentControls">{}</pre>
+  </section>
+
+  <section class="card">
+    <div class="row"><button class="secondary" onclick="loadLatest()">查看最新照片</button></div>
+    <img id="latest" alt="尚无预览">
+  </section>
+
+  <div id="message"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+$("token").value = localStorage.getItem("aircamToken") || "";
+function saveToken() {
+  localStorage.setItem("aircamToken", $("token").value);
+  message("令牌已保存在本浏览器");
+  refresh();
+}
+function headers(json=true) {
+  const h = {"X-AirCam-Token": $("token").value};
+  if (json) h["Content-Type"] = "application/json";
+  return h;
+}
+function message(text) { $("message").textContent = text || ""; }
+async function api(path, options={}) {
+  const response = await fetch(path, {...options, headers:headers(true)});
+  const body = await response.json();
+  if (!response.ok || !body.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  return body;
+}
+function formatBytes(n) {
+  if (!Number.isFinite(n)) return "?";
+  for (const u of ["B","KB","MB","GB","TB"]) {
+    if (n < 1024 || u === "TB") return `${n.toFixed(u==="B"?0:1)} ${u}`;
+    n /= 1024;
+  }
+}
+async function refresh() {
+  try {
+    const body = await api("/api/status");
+    const s = body.status;
+    $("state").textContent = s.state;
+    $("state").className = s.state;
+    $("details").textContent =
+      `任务：${s.session || "-"}　照片：${s.photo_count}　恢复：${s.restart_count || 0} 次　剩余：${formatBytes(s.disk.free_bytes)}`;
+    $("currentControls").textContent = JSON.stringify(s.active_controls || {}, null, 2);
+    $("start").disabled = s.state === "capturing";
+    $("stop").disabled = s.state !== "capturing";
+    message(s.last_error || "");
+  } catch (e) { message(e.message); }
+}
+async function startCapture() {
+  try {
+    await api("/api/start", {method:"POST", body:JSON.stringify({
+      interval_seconds:Number($("interval").value)
+    })});
+    message("拍照已开始"); await refresh();
+  } catch (e) { message(e.message); }
+}
+async function stopCapture() {
+  try {
+    await api("/api/stop", {method:"POST", body:"{}"});
+    message("拍照已结束，文件已关闭"); await refresh();
+  } catch (e) { message(e.message); }
+}
+async function setExposure() {
+  try {
+    const controls = {
+      auto_exposure:Number($("auto_exposure").value)
+    };
+    if (controls.auto_exposure === 1) {
+      controls.exposure_time_absolute =
+        Number($("exposure_time_absolute").value);
+    }
+    await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
+    message("相机参数已应用");
+  } catch (e) { message(e.message); }
+}
+async function setCustomControls() {
+  try {
+    const controls = JSON.parse($("customControls").value);
+    if (!controls || Array.isArray(controls) || typeof controls !== "object") {
+      throw new Error("参数必须是JSON对象");
+    }
+    for (const [name, value] of Object.entries(controls)) {
+      if (!Number.isInteger(value)) throw new Error(`${name} 的值必须是整数`);
+    }
+    await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
+    message("自定义相机参数已应用");
+    await refresh();
+  } catch (e) { message(e.message); }
+}
+async function loadControls() {
+  try {
+    const body = await api("/api/controls");
+    $("controls").hidden = false; $("controls").textContent = body.raw;
+    message("");
+  } catch (e) { message(e.message); }
+}
+async function loadLatest() {
+  try {
+    const response = await fetch("/api/latest", {headers:headers(false)});
+    if (!response.ok) {
+      const body = await response.json(); throw new Error(body.error || "读取失败");
+    }
+    const blob = await response.blob();
+    const old = $("latest").dataset.url;
+    if (old) URL.revokeObjectURL(old);
+    const url = URL.createObjectURL(blob);
+    $("latest").dataset.url = url; $("latest").src = url;
+    message("");
+  } catch (e) { message(e.message); }
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

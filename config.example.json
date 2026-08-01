@@ -1,0 +1,38 @@
+{
+  "camera": {
+    "device": "/dev/video0",
+    "input_format": "mjpeg",
+    "controls": {
+      "auto_exposure": 3,
+      "white_balance_automatic": 1,
+      "power_line_frequency": 1,
+      "backlight_compensation": 0
+    }
+  },
+  "capture": {
+    "width": 2592,
+    "height": 1944,
+    "source_fps": 30,
+    "interval_seconds": 1.0,
+    "jpeg_quality": 2,
+    "auto_restart": true,
+    "max_restarts": 3,
+    "restart_delay_seconds": 2
+  },
+  "storage": {
+    "data_dir": "/home/pi/Pictures/AirCam",
+    "min_free_mb": 512
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "token": "CHANGE_ME"
+  },
+  "gpio": {
+    "enabled": false,
+    "bcm_pin": 17,
+    "active_high": true,
+    "pull_up": null,
+    "bounce_time": 0.15
+  }
+}

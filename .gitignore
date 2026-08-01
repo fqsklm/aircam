@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+
+# Local runtime configuration may contain the real access token.
+config/config.json
+.env
+
+# Generated camera reports, logs, archives, and captured media.
+camera-report.txt
+*.log
+*.tar.gz
+photos/
+captures/
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.avi
+*.mkv
