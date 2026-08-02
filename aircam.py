@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +33,7 @@ from urllib.parse import urlparse
 LOG = logging.getLogger("aircam")
 CONTROL_NAME = re.compile(r"^[A-Za-z0-9_]+$")
 MIN_CAPTURE_INTERVAL_SECONDS = 0.0334
+MAX_CAPTURE_DURATION_SECONDS = 7 * 24 * 60 * 60
 SHOWINFO_TIMEBASE = re.compile(r"config in time_base:\s*(\d+)/(\d+)")
 SHOWINFO_FRAME = re.compile(r"\bn:\s*(\d+)\s+pts:\s*(-?\d+)")
 PENDING_PHOTO = re.compile(r"^pending_(\d{8})\.jpg$")
@@ -157,6 +158,22 @@ def check_number(
     return value
 
 
+def normalize_duration_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AirCamError("duration_seconds 必须是数字")
+    value = float(value)
+    if value == 0:
+        return None
+    return check_number(
+        value,
+        "duration_seconds",
+        0.1,
+        MAX_CAPTURE_DURATION_SECONDS,
+    )
+
+
 @dataclass
 class CaptureStatus:
     state: str = "idle"
@@ -166,6 +183,9 @@ class CaptureStatus:
     last_error: str | None = None
     pid: int | None = None
     restart_count: int = 0
+    duration_seconds: float | None = None
+    auto_stop_at: str | None = None
+    stop_reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -176,6 +196,9 @@ class CaptureStatus:
             "last_error": self.last_error,
             "pid": self.pid,
             "restart_count": self.restart_count,
+            "duration_seconds": self.duration_seconds,
+            "auto_stop_at": self.auto_stop_at,
+            "stop_reason": self.stop_reason,
         }
 
 
@@ -194,6 +217,7 @@ class CameraService:
         self.process: subprocess.Popen[bytes] | None = None
         self.worker: threading.Thread | None = None
         self.stop_event = threading.Event()
+        self.stop_deadline_monotonic: float | None = None
         self.session_dir: Path | None = None
         self.manifested_photos: set[str] = set()
         self.frame_timestamps_us: dict[str, int] = {}
@@ -610,7 +634,11 @@ class CameraService:
                 highest = max(highest, int(match.group(1)))
         return highest + 1
 
-    def start(self, interval_seconds: Any = None) -> dict[str, Any]:
+    def start(
+        self,
+        interval_seconds: Any = None,
+        duration_seconds: Any = None,
+    ) -> dict[str, Any]:
         with self.lock:
             if self._is_running() or self.status.state in {
                 "starting",
@@ -630,6 +658,16 @@ class CameraService:
                 "interval_seconds",
                 MIN_CAPTURE_INTERVAL_SECONDS,
                 3600,
+            )
+            duration = normalize_duration_seconds(duration_seconds)
+            started_at = utc_now()
+            auto_stop_at = (
+                (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=duration)
+                ).isoformat(timespec="seconds")
+                if duration is not None
+                else None
             )
 
             controls = dict(self.active_controls)
@@ -659,9 +697,11 @@ class CameraService:
 
             metadata = {
                 "session": session_name,
-                "started_at": utc_now(),
+                "started_at": started_at,
                 "device": self.device,
                 "interval_seconds": interval,
+                "duration_seconds": duration,
+                "auto_stop_at": auto_stop_at,
                 "camera": self.config["camera"],
                 "active_controls": dict(self.active_controls),
                 "capture": self.config["capture"],
@@ -678,6 +718,8 @@ class CameraService:
                 state="starting",
                 session=session_name,
                 started_at=metadata["started_at"],
+                duration_seconds=duration,
+                auto_stop_at=auto_stop_at,
             )
             self._record_control_event(time.time())
             try:
@@ -689,17 +731,27 @@ class CameraService:
                     started_at=metadata["started_at"],
                     stopped_at=utc_now(),
                     last_error=str(exc),
+                    duration_seconds=duration,
+                    auto_stop_at=auto_stop_at,
                 )
+                self.stop_deadline_monotonic = None
                 self._save_state()
                 raise
 
             self.stop_event.clear()
+            self.stop_deadline_monotonic = (
+                time.monotonic() + duration
+                if duration is not None
+                else None
+            )
             self.process = process
             self.status = CaptureStatus(
                 state="capturing",
                 session=session_name,
                 started_at=metadata["started_at"],
                 pid=process.pid,
+                duration_seconds=duration,
+                auto_stop_at=auto_stop_at,
             )
             self._save_state()
             self.worker = threading.Thread(
@@ -711,6 +763,25 @@ class CameraService:
             self.worker.start()
             LOG.info("capture started: session=%s pid=%s", session_name, process.pid)
             return self.get_status()
+
+    def _duration_has_elapsed(self) -> bool:
+        with self.lock:
+            deadline = self.stop_deadline_monotonic
+            if deadline is None or time.monotonic() < deadline:
+                return False
+            self.stop_event.set()
+            self.status.state = "stopping"
+            self.status.stop_reason = "duration_elapsed"
+            self._save_state()
+            return True
+
+    def _finish_recovery_stop(self) -> None:
+        with self.lock:
+            self.status.state = "idle"
+            self.status.stopped_at = utc_now()
+            self.status.pid = None
+            self.stop_deadline_monotonic = None
+            self._save_state()
 
     @staticmethod
     def _signal_process(process: subprocess.Popen[bytes]) -> None:
@@ -730,6 +801,7 @@ class CameraService:
             self.config["capture"].get("restart_delay_seconds", 2)
         )
         disk_guard_triggered = False
+        duration_elapsed = False
 
         while True:
             with self.lock:
@@ -739,6 +811,11 @@ class CameraService:
 
             self._record_new_photos(session_dir, interval)
 
+            if not self.stop_event.is_set() and self._duration_has_elapsed():
+                duration_elapsed = True
+                LOG.info("capture duration elapsed: session=%s", self.status.session)
+                self._signal_process(process)
+
             if not self.stop_event.is_set():
                 free = shutil.disk_usage(self.data_dir).free
                 if free < self._minimum_free_bytes():
@@ -746,6 +823,7 @@ class CameraService:
                     self.stop_event.set()
                     with self.lock:
                         self.status.state = "stopping"
+                        self.status.stop_reason = "disk_guard"
                         self.status.last_error = (
                             "已停止拍照：磁盘剩余空间低于安全阈值"
                         )
@@ -773,6 +851,9 @@ class CameraService:
                 with self.lock:
                     self.status.stopped_at = utc_now()
                     self.status.state = "error" if disk_guard_triggered else "idle"
+                    if not duration_elapsed and self.status.stop_reason is None:
+                        self.status.stop_reason = "manual"
+                    self.stop_deadline_monotonic = None
                     self._save_state()
                 return
 
@@ -795,16 +876,27 @@ class CameraService:
                 attempt = self.status.restart_count
 
             while True:
+                if self._duration_has_elapsed():
+                    self._finish_recovery_stop()
+                    return
                 LOG.warning(
                     "capture process exited; recovery attempt %s/%s",
                     attempt,
                     max_restarts,
                 )
-                if self.stop_event.wait(restart_delay):
-                    with self.lock:
-                        self.status.state = "idle"
-                        self.status.stopped_at = utc_now()
-                        self._save_state()
+                with self.lock:
+                    deadline = self.stop_deadline_monotonic
+                wait_seconds = restart_delay
+                if deadline is not None:
+                    wait_seconds = min(
+                        wait_seconds,
+                        max(0.0, deadline - time.monotonic()),
+                    )
+                if self.stop_event.wait(wait_seconds):
+                    self._finish_recovery_stop()
+                    return
+                if self._duration_has_elapsed():
+                    self._finish_recovery_stop()
                     return
 
                 next_number = self._next_photo_number(session_dir)
@@ -851,6 +943,8 @@ class CameraService:
             worker = self.worker
             self.stop_event.set()
             self.status.state = "stopping"
+            if self.status.stop_reason is None:
+                self.status.stop_reason = "manual"
             self._save_state()
 
         if process is not None:
@@ -874,6 +968,7 @@ class CameraService:
             self.status.state = "idle"
             self.status.pid = None
             self.status.stopped_at = utc_now()
+            self.stop_deadline_monotonic = None
             self._save_state()
             LOG.info("capture stopped: session=%s", self.status.session)
             return self.get_status()
@@ -898,6 +993,14 @@ class CameraService:
             }
             status["device"] = self.device
             status["active_controls"] = dict(self.active_controls)
+            deadline = self.stop_deadline_monotonic
+            status["remaining_seconds"] = (
+                max(0.0, deadline - time.monotonic())
+                if deadline is not None
+                and self.status.state
+                in {"starting", "capturing", "recovering", "stopping"}
+                else None
+            )
             return status
 
     def latest_photo(self) -> Path | None:
@@ -1113,7 +1216,10 @@ class AirCamHandler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             if path == "/api/start":
-                status = self.app.camera.start(payload.get("interval_seconds"))
+                status = self.app.camera.start(
+                    payload.get("interval_seconds"),
+                    payload.get("duration_seconds"),
+                )
                 self._json(HTTPStatus.OK, {"ok": True, "status": status})
             elif path == "/api/stop":
                 status = self.app.camera.stop()
