@@ -228,6 +228,37 @@
     .preview-frame.has-image img { display:block; }
     .empty-preview { text-align:center; color:var(--muted); padding:35px; }
     .preview-frame.has-image .empty-preview { display:none; }
+    .storage-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+    .storage-actions { display:flex; gap:10px; flex-wrap:wrap; }
+    .session-list { display:grid; gap:10px; margin-top:16px; }
+    .session-card {
+      display:grid;
+      grid-template-columns:minmax(0, 1fr) auto;
+      gap:14px;
+      align-items:center;
+      padding:15px;
+      border:1px solid var(--line);
+      border-radius:13px;
+      background:rgba(6,15,22,.48);
+    }
+    .session-name { color:var(--text); font-weight:780; font-variant-numeric:tabular-nums; }
+    .session-meta { display:flex; flex-wrap:wrap; gap:6px 14px; margin-top:6px; color:var(--muted); font-size:.78rem; }
+    .session-card-actions { display:flex; gap:8px; }
+    .session-empty { padding:28px; border:1px dashed var(--line-strong); border-radius:13px; text-align:center; color:var(--muted); }
+    dialog {
+      width:min(470px, calc(100vw - 28px));
+      padding:0;
+      border:1px solid var(--line-strong);
+      border-radius:16px;
+      background:#0b1821;
+      color:var(--text);
+      box-shadow:0 24px 80px rgba(0,0,0,.6);
+    }
+    dialog::backdrop { background:rgba(0,7,11,.76); backdrop-filter:blur(3px); }
+    .dialog-body { padding:22px; }
+    .dialog-body h3 { margin:0 0 10px; font-size:1.08rem; }
+    .dialog-body p { margin:0 0 14px; color:var(--muted); line-height:1.6; }
+    .dialog-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:18px; }
     .empty-icon { display:block; margin:0 auto 10px; font-size:2rem; opacity:.6; }
     details.panel > summary {
       list-style:none;
@@ -307,6 +338,8 @@
       .settings-grid { grid-template-columns:1fr; }
       .panel-actions { display:grid; }
       .range-row { grid-template-columns:1fr 84px; }
+      .session-card { grid-template-columns:1fr; }
+      .session-card-actions { display:grid; grid-template-columns:1fr 1fr; }
     }
   </style>
 </head>
@@ -448,6 +481,25 @@
         </div>
       </section>
 
+      <section class="panel" aria-labelledby="storageTitle">
+        <div class="panel-body">
+          <div class="storage-toolbar">
+            <div>
+              <div class="eyebrow">Photo storage</div>
+              <h2 id="storageTitle">照片导入与清理</h2>
+              <span class="helper">网页会先完整接收 ZIP，再交给浏览器保存；适用于不超过 512 MB 的任务。</span>
+            </div>
+            <div class="storage-actions">
+              <button id="refreshSessionsBtn" class="button secondary storage-action" type="button">刷新任务</button>
+              <button id="clearAllBtn" class="button danger storage-action" type="button">清空全部照片</button>
+            </div>
+          </div>
+          <div id="sessionList" class="session-list" aria-live="polite">
+            <div class="session-empty">正在读取拍摄任务…</div>
+          </div>
+        </div>
+      </section>
+
       <details class="panel" id="settingsPanel">
         <summary>连接与高级设置 <span class="helper">令牌、V4L2 自定义参数</span></summary>
         <div class="panel-body">
@@ -477,18 +529,35 @@
     <footer>照片时间使用 UTC 微秒命名 · 飞行前请完成地面测试</footer>
   </div>
 
+  <dialog id="clearDialog">
+    <div class="dialog-body">
+      <h3>永久清空树莓派照片</h3>
+      <p>这会删除全部拍摄任务、照片和任务清单，但保留 <code>/home/pi/Pictures/AirCam</code> 总目录。操作无法恢复。</p>
+      <label>
+        <span class="field-label">请输入“清空全部照片”确认</span>
+        <input id="clearConfirmText" type="text" autocomplete="off" placeholder="清空全部照片">
+      </label>
+      <div class="dialog-actions">
+        <button id="cancelClearBtn" class="button secondary" type="button">取消</button>
+        <button id="confirmClearBtn" class="button danger" type="button" disabled>永久清空</button>
+      </div>
+    </div>
+  </dialog>
+
 <script>
 const $ = id => document.getElementById(id);
 const MIN_INTERVAL = 0.0334;
 const MAX_INTERVAL = 3600;
 const MAX_DURATION_MINUTES = 7 * 24 * 60;
 const INTERVAL_STEPS = [0.0334, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600];
+const BROWSER_IMPORT_LIMIT_BYTES = 512 * 1024 * 1024;
 const stateLabels = {
   idle:"待机", starting:"启动中", capturing:"拍摄中", recovering:"恢复中",
   stopping:"停止中", error:"错误"
 };
 let latestStatus = null;
 let latestStatusReceivedAt = 0;
+let latestSessions = [];
 
 $("token").value = localStorage.getItem("aircamToken") || "";
 
@@ -559,6 +628,84 @@ function formatBytes(value) {
   }
 }
 
+function formatSessionTime(value) {
+  if (!value) return "时间未知";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function resetPreview() {
+  const oldUrl = $("latest").dataset.url;
+  if (oldUrl) URL.revokeObjectURL(oldUrl);
+  $("latest").removeAttribute("src");
+  $("latest").dataset.url = "";
+  $("previewFrame").classList.remove("has-image");
+}
+
+function renderSessions() {
+  const list = $("sessionList");
+  list.replaceChildren();
+  if (!latestSessions.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent = "还没有拍摄任务";
+    list.appendChild(empty);
+    return;
+  }
+  for (const session of latestSessions) {
+    const card = document.createElement("article");
+    card.className = "session-card";
+    const info = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "session-name";
+    name.textContent = session.session;
+    const meta = document.createElement("div");
+    meta.className = "session-meta";
+    for (const text of [
+      formatSessionTime(session.started_at),
+      `${session.photo_count} 张照片`,
+      formatBytes(session.size_bytes)
+    ]) {
+      const item = document.createElement("span");
+      item.textContent = text;
+      meta.appendChild(item);
+    }
+    info.append(name, meta);
+
+    const actions = document.createElement("div");
+    actions.className = "session-card-actions";
+    const download = document.createElement("button");
+    download.className = "button storage-action";
+    download.type = "button";
+    download.textContent = "导入电脑";
+    download.addEventListener("click", () => {
+      runButton(download, "准备中", "文件已准备完成", () => downloadSession(session, download)).catch(() => {});
+    });
+    const remove = document.createElement("button");
+    remove.className = "button danger storage-action";
+    remove.type = "button";
+    remove.textContent = "删除任务";
+    remove.addEventListener("click", () => {
+      if (!window.confirm(`永久删除任务 ${session.session} 的全部照片？此操作无法恢复。`)) return;
+      runButton(remove, "删除中", "任务已删除", () => deleteSession(session.session)).catch(() => {});
+    });
+    actions.append(download, remove);
+    card.append(info, actions);
+    list.appendChild(card);
+  }
+  applyStorageAvailability();
+}
+
+function applyStorageAvailability() {
+  const state = latestStatus && latestStatus.state;
+  const busy = ["starting", "capturing", "recovering", "stopping"].includes(state)
+    || Boolean(latestStatus && latestStatus.export_active);
+  document.querySelectorAll(".storage-action").forEach(button => {
+    if (button.dataset.busy !== "true") button.disabled = busy;
+  });
+  if (!busy && !latestSessions.length) $("clearAllBtn").disabled = true;
+}
+
 function setConnection(online) {
   const badge = $("connectionBadge");
   badge.className = `connection ${online ? "online" : "offline"}`;
@@ -596,6 +743,7 @@ function renderDurationStatus() {
 
 function applyStatus(status) {
   if (!status) return;
+  const previousState = latestStatus && latestStatus.state;
   if (status !== latestStatus) latestStatusReceivedAt = Date.now();
   latestStatus = status;
   const state = status.state || "未知";
@@ -623,6 +771,13 @@ function applyStatus(status) {
   for (const element of [$("durationMinutes"), ...document.querySelectorAll(".duration-preset")]) {
     element.disabled = capturing;
   }
+  applyStorageAvailability();
+  if (
+    ["starting", "capturing", "recovering", "stopping"].includes(previousState)
+    && !["starting", "capturing", "recovering", "stopping"].includes(state)
+  ) {
+    refreshSessions().catch(error => showToast(error.message || String(error), "error"));
+  }
 }
 
 async function refreshStatus({quiet=false}={}) {
@@ -636,6 +791,17 @@ async function refreshStatus({quiet=false}={}) {
     if (!quiet) showToast(error.message || String(error), "error");
     throw error;
   }
+}
+
+async function refreshSessions() {
+  const body = await api("/api/sessions");
+  latestSessions = body.sessions || [];
+  renderSessions();
+  return latestSessions;
+}
+
+async function refreshAll() {
+  await Promise.all([refreshStatus({quiet:true}), refreshSessions()]);
 }
 
 function readInterval() {
@@ -771,6 +937,73 @@ async function loadLatest() {
   $("previewFrame").classList.add("has-image");
 }
 
+async function downloadSession(session, button) {
+  if (session.size_bytes > BROWSER_IMPORT_LIMIT_BYTES) {
+    throw new Error("任务超过 512 MB。为避免浏览器内存不足，请使用 SFTP 导入该任务。");
+  }
+  const body = await api(`/api/sessions/${encodeURIComponent(session.session)}/download-ticket`, {
+    method:"POST",
+    body:"{}"
+  });
+  const response = await fetch(body.download_url, {cache:"no-store"});
+  if (!response.ok) {
+    let errorBody = null;
+    try { errorBody = await response.json(); } catch (_) { /* handled below */ }
+    throw new Error((errorBody && errorBody.error) || `下载失败（HTTP ${response.status}）`);
+  }
+
+  let blob;
+  if (response.body && typeof response.body.getReader === "function") {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.byteLength;
+      const percent = session.size_bytes > 0
+        ? Math.min(99, Math.floor(received * 100 / session.size_bytes))
+        : null;
+      button.textContent = percent === null ? "接收中" : `接收中 ${percent}%`;
+    }
+    blob = new Blob(chunks, {type:"application/zip"});
+  } else {
+    button.textContent = "接收中";
+    blob = await response.blob();
+  }
+  if (blob.size < 22) throw new Error("收到的 ZIP 文件不完整，请重试");
+
+  button.textContent = "保存中";
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `AirCam_${session.session}.zip`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+async function deleteSession(session) {
+  await api(`/api/sessions/${encodeURIComponent(session)}/delete`, {
+    method:"POST",
+    body:JSON.stringify({confirm_session:session})
+  });
+  resetPreview();
+  await refreshAll();
+}
+
+async function clearAllSessions() {
+  await api("/api/sessions/clear", {
+    method:"POST",
+    body:JSON.stringify({confirm_text:$("clearConfirmText").value})
+  });
+  latestSessions = [];
+  resetPreview();
+  await refreshAll();
+}
+
 $("interval").addEventListener("input", updateIntervalUi);
 $("interval").addEventListener("change", () => {
   try { setIntervalValue(readInterval()); } catch (error) { showToast(error.message, "error"); }
@@ -807,22 +1040,38 @@ document.querySelectorAll(".exposure-preset").forEach(button => {
   });
 });
 
-$("refreshBtn").addEventListener("click", event => runButton(event.currentTarget, "刷新中", "状态已刷新", () => refreshStatus({quiet:true})).catch(() => {}));
+$("refreshBtn").addEventListener("click", event => runButton(event.currentTarget, "刷新中", "状态已刷新", refreshAll).catch(() => {}));
 $("startBtn").addEventListener("click", event => runButton(event.currentTarget, "启动中", "拍照已开始", startCapture).catch(() => {}));
 $("stopBtn").addEventListener("click", event => runButton(event.currentTarget, "停止中", "拍照已结束，文件已安全关闭", stopCapture).catch(() => {}));
 $("applyExposureBtn").addEventListener("click", event => runButton(event.currentTarget, "应用中", "曝光参数已应用", applyExposure).catch(() => {}));
 $("loadControlsBtn").addEventListener("click", event => runButton(event.currentTarget, "读取中", "摄像头支持项已读取", loadControls).catch(() => {}));
 $("applyCustomBtn").addEventListener("click", event => runButton(event.currentTarget, "应用中", "自定义参数已应用", applyCustomControls).catch(() => {}));
 $("latestBtn").addEventListener("click", event => runButton(event.currentTarget, "加载中", "最新照片已加载", loadLatest).catch(() => {}));
+$("refreshSessionsBtn").addEventListener("click", event => runButton(event.currentTarget, "刷新中", "任务列表已刷新", refreshSessions).catch(() => {}));
+$("clearAllBtn").addEventListener("click", () => {
+  $("clearConfirmText").value = "";
+  $("confirmClearBtn").disabled = true;
+  $("clearDialog").showModal();
+  $("clearConfirmText").focus();
+});
+$("cancelClearBtn").addEventListener("click", () => $("clearDialog").close());
+$("clearConfirmText").addEventListener("input", () => {
+  $("confirmClearBtn").disabled = $("clearConfirmText").value !== "清空全部照片";
+});
+$("confirmClearBtn").addEventListener("click", event => {
+  runButton(event.currentTarget, "清理中", "全部照片已清理", clearAllSessions)
+    .then(() => $("clearDialog").close())
+    .catch(() => {});
+});
 $("saveTokenBtn").addEventListener("click", event => runButton(event.currentTarget, "保存中", "令牌已保存在本浏览器", async () => {
   localStorage.setItem("aircamToken", $("token").value.trim());
-  await refreshStatus({quiet:true});
+  await refreshAll();
 }).catch(() => {}));
 
 updateIntervalUi();
 updateDurationUi();
 updateExposureUi();
-refreshStatus().catch(() => {
+refreshAll().catch(() => {
   if (!$("token").value) $("settingsPanel").open = true;
 });
 window.setInterval(() => {

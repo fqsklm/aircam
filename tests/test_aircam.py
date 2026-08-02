@@ -1,4 +1,5 @@
 import csv
+import io
 import json
 import tempfile
 import threading
@@ -6,6 +7,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -41,6 +43,19 @@ def config(root: str) -> dict:
 
 
 class AirCamTests(unittest.TestCase):
+    def test_chunked_writer_sends_an_explicit_final_chunk(self):
+        output = io.BytesIO()
+        writer = aircam.ChunkedWriter(output)
+
+        self.assertEqual(writer.write(b"abc"), 3)
+        self.assertEqual(writer.write(b""), 0)
+        writer.finish()
+        writer.finish()
+
+        self.assertEqual(output.getvalue(), b"3\r\nabc\r\n0\r\n\r\n")
+        with self.assertRaises(ValueError):
+            writer.write(b"late")
+
     def test_load_config_rejects_missing_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -182,6 +197,57 @@ class AirCamTests(unittest.TestCase):
             self.assertEqual(
                 latest_after_restart.name, "photo_00000001.jpg"
             )
+
+    def test_session_listing_delete_and_clear_preserve_storage_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = aircam.CameraService(config(tmp))
+            first = Path(tmp) / "photos" / "20260802_120000"
+            first.mkdir()
+            (first / "photo_00000001.jpg").write_bytes(b"jpeg-one")
+            (first / "manifest.csv").write_text("name\n", encoding="utf-8")
+            (first / "session.json").write_text(
+                json.dumps(
+                    {
+                        "started_at": "2026-08-02T04:00:00+00:00",
+                        "interval_seconds": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sessions = service.list_sessions()
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0]["session"], first.name)
+            self.assertEqual(sessions[0]["photo_count"], 1)
+            self.assertGreaterEqual(sessions[0]["size_bytes"], len(b"jpeg-one"))
+
+            service.status.session = first.name
+            deleted = service.delete_session(first.name)
+            self.assertEqual(deleted["deleted_session"], first.name)
+            self.assertFalse(first.exists())
+            self.assertTrue(service.data_dir.is_dir())
+            self.assertTrue(service.state_path.is_file())
+
+            second = Path(tmp) / "photos" / "20260802_130000"
+            second.mkdir()
+            (second / "photo_00000001.jpg").write_bytes(b"jpeg-two")
+            cleared = service.clear_sessions()
+            self.assertEqual(cleared["deleted_sessions"], 1)
+            self.assertTrue(service.data_dir.is_dir())
+            self.assertEqual(service.list_sessions(), [])
+
+    def test_session_storage_actions_reject_busy_and_unsafe_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = aircam.CameraService(config(tmp))
+            session = Path(tmp) / "photos" / "20260802_120000"
+            session.mkdir()
+            with self.assertRaises(aircam.AirCamError):
+                service.delete_session("../AirCam")
+            service.status.state = "capturing"
+            with self.assertRaises(aircam.AirCamError):
+                service.delete_session(session.name)
+            with self.assertRaises(aircam.AirCamError):
+                service.clear_sessions()
 
     def test_next_photo_number_never_overwrites_after_a_gap(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -448,6 +514,105 @@ class AirCamTests(unittest.TestCase):
                 server.server_close()
                 thread.join(timeout=2)
 
+    def test_http_session_download_ticket_and_confirmed_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = config(tmp)
+            camera = aircam.CameraService(value)
+            session = Path(tmp) / "photos" / "20260802_140000"
+            session.mkdir()
+            (session / "photo_00000001.jpg").write_bytes(b"jpeg-data")
+            (session / "pending_00000002.jpg.tmp").write_bytes(b"incomplete")
+            (session / "manifest.csv").write_text(
+                "filename\nphoto_00000001.jpg\n", encoding="utf-8"
+            )
+            (session / "session.json").write_text(
+                json.dumps({"started_at": "2026-08-02T06:00:00+00:00"}),
+                encoding="utf-8",
+            )
+            index = Path(tmp) / "index.html"
+            index.write_text("<p>AirCam</p>", encoding="utf-8")
+            server = aircam.AirCamHttpServer(
+                ("127.0.0.1", 0), camera, value, index
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            auth_headers = {
+                "X-AirCam-Token": "test",
+                "Content-Type": "application/json",
+            }
+            try:
+                list_request = urllib.request.Request(
+                    base + "/api/sessions", headers=auth_headers
+                )
+                with urllib.request.urlopen(list_request, timeout=2) as response:
+                    sessions = json.loads(response.read())["sessions"]
+                self.assertEqual(sessions[0]["session"], session.name)
+
+                ticket_request = urllib.request.Request(
+                    base + f"/api/sessions/{session.name}/download-ticket",
+                    method="POST",
+                    data=b"{}",
+                    headers=auth_headers,
+                )
+                with urllib.request.urlopen(ticket_request, timeout=2) as response:
+                    ticket_body = json.loads(response.read())
+                download_url = base + ticket_body["download_url"]
+                with urllib.request.urlopen(download_url, timeout=2) as response:
+                    archive_bytes = response.read()
+                    self.assertIn(
+                        "attachment", response.headers["Content-Disposition"]
+                    )
+                    self.assertEqual(
+                        response.headers["Transfer-Encoding"], "chunked"
+                    )
+                    self.assertIsNone(response.headers["Content-Length"])
+                with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+                    self.assertEqual(
+                        archive.read(f"{session.name}/photo_00000001.jpg"),
+                        b"jpeg-data",
+                    )
+                    self.assertFalse(
+                        any(
+                            Path(name).name.startswith("pending_")
+                            for name in archive.namelist()
+                        )
+                    )
+                self.assertFalse(camera.export_active)
+
+                with self.assertRaises(urllib.error.HTTPError) as reused:
+                    urllib.request.urlopen(download_url, timeout=2)
+                self.assertEqual(reused.exception.code, 400)
+
+                wrong_clear = urllib.request.Request(
+                    base + "/api/sessions/clear",
+                    method="POST",
+                    data=json.dumps({"confirm_text": "清空"}).encode("utf-8"),
+                    headers=auth_headers,
+                )
+                with self.assertRaises(urllib.error.HTTPError) as rejected:
+                    urllib.request.urlopen(wrong_clear, timeout=2)
+                self.assertEqual(rejected.exception.code, 400)
+                self.assertTrue(session.is_dir())
+
+                clear_request = urllib.request.Request(
+                    base + "/api/sessions/clear",
+                    method="POST",
+                    data=json.dumps(
+                        {"confirm_text": aircam.CLEAR_ALL_CONFIRMATION}
+                    ).encode("utf-8"),
+                    headers=auth_headers,
+                )
+                with urllib.request.urlopen(clear_request, timeout=2) as response:
+                    cleared = json.loads(response.read())
+                self.assertEqual(cleared["deleted_sessions"], 1)
+                self.assertTrue(camera.data_dir.is_dir())
+                self.assertFalse(session.exists())
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
     def test_systemd_unit_enables_boot_and_failure_restart(self):
         unit = (
             Path(__file__).resolve().parents[1] / "systemd" / "aircam.service"
@@ -469,6 +634,15 @@ class AirCamTests(unittest.TestCase):
         self.assertIn('id="durationRemaining"', page)
         self.assertIn("duration_seconds:duration", page)
         self.assertIn("function renderDurationStatus", page)
+        self.assertIn('id="sessionList"', page)
+        self.assertIn('id="clearDialog"', page)
+        self.assertIn("function downloadSession", page)
+        self.assertIn("BROWSER_IMPORT_LIMIT_BYTES", page)
+        self.assertIn("response.body.getReader()", page)
+        self.assertIn("URL.createObjectURL(blob)", page)
+        self.assertIn("接收中 ${percent}%", page)
+        self.assertIn("function clearAllSessions", page)
+        self.assertIn("/download-ticket", page)
         self.assertIn('button.disabled = false;', page)
         self.assertIn('aria-live="polite"', page)
         self.assertNotIn('class="brand-mark"', page)
@@ -481,6 +655,9 @@ class AirCamTests(unittest.TestCase):
             "loadControlsBtn",
             "applyCustomBtn",
             "latestBtn",
+            "refreshSessionsBtn",
+            "clearAllBtn",
+            "confirmClearBtn",
             "saveTokenBtn",
         ):
             self.assertIn(f'$("{button_id}").addEventListener', page)
