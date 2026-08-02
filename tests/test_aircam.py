@@ -409,6 +409,7 @@ class AirCamTests(unittest.TestCase):
         self.assertIn("最小 0.0334 秒", page)
         self.assertIn("function adjustInterval", page)
         self.assertIn("function runButton", page)
+        self.assertIn('button.disabled = false;', page)
         self.assertIn('aria-live="polite"', page)
         self.assertNotIn('class="brand-mark"', page)
         self.assertNotIn("onclick=", page)
