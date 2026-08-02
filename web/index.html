@@ -140,6 +140,7 @@
     input:focus, textarea:focus, select:focus { border-color:var(--primary); box-shadow:0 0 0 3px rgba(64,169,255,.13); }
     input:disabled, textarea:disabled, select:disabled { opacity:.48; cursor:not-allowed; }
     .presets { display:flex; flex-wrap:wrap; gap:7px; margin-top:11px; }
+    .duration-setting { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); }
     .chip {
       min-height:34px;
       padding:0 11px;
@@ -365,6 +366,22 @@
                 <button class="chip interval-preset" type="button" data-interval="2">2s</button>
                 <button class="chip interval-preset" type="button" data-interval="5">5s</button>
               </div>
+              <div class="duration-setting">
+                <label class="field-label" for="durationMinutes">自动停止时长（分钟）</label>
+                <input id="durationMinutes" type="number" inputmode="decimal" min="0" max="10080" step="0.1" value="0" aria-describedby="durationMeta">
+                <div id="durationMeta" class="field-meta">
+                  <span>0 = 不限时，最长 7 天</span>
+                  <span id="durationRemaining">不限时</span>
+                </div>
+                <div class="presets" aria-label="常用拍摄时长">
+                  <button class="chip duration-preset selected" type="button" data-duration="0">不限时</button>
+                  <button class="chip duration-preset" type="button" data-duration="1">1分钟</button>
+                  <button class="chip duration-preset" type="button" data-duration="5">5分钟</button>
+                  <button class="chip duration-preset" type="button" data-duration="10">10分钟</button>
+                  <button class="chip duration-preset" type="button" data-duration="30">30分钟</button>
+                  <button class="chip duration-preset" type="button" data-duration="60">60分钟</button>
+                </div>
+              </div>
             </div>
             <div class="capture-actions">
               <button id="startBtn" class="button" type="button">开始拍照</button>
@@ -464,12 +481,14 @@
 const $ = id => document.getElementById(id);
 const MIN_INTERVAL = 0.0334;
 const MAX_INTERVAL = 3600;
+const MAX_DURATION_MINUTES = 7 * 24 * 60;
 const INTERVAL_STEPS = [0.0334, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600];
 const stateLabels = {
   idle:"待机", starting:"启动中", capturing:"拍摄中", recovering:"恢复中",
   stopping:"停止中", error:"错误"
 };
 let latestStatus = null;
+let latestStatusReceivedAt = 0;
 
 $("token").value = localStorage.getItem("aircamToken") || "";
 
@@ -546,8 +565,38 @@ function setConnection(online) {
   badge.innerHTML = `<span>${online ? "树莓派在线" : "连接失败"}</span>`;
 }
 
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.ceil(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainder = total % 60;
+  return hours > 0
+    ? `${String(hours).padStart(2,"0")}:${String(minutes).padStart(2,"0")}:${String(remainder).padStart(2,"0")}`
+    : `${String(minutes).padStart(2,"0")}:${String(remainder).padStart(2,"0")}`;
+}
+
+function renderDurationStatus() {
+  const status = latestStatus;
+  const output = $("durationRemaining");
+  if (!status) {
+    output.textContent = Number($("durationMinutes").value) === 0 ? "不限时" : "等待开始";
+    return;
+  }
+  const active = ["starting", "capturing", "recovering", "stopping"].includes(status.state);
+  if (active && Number.isFinite(status.remaining_seconds)) {
+    const elapsed = Math.max(0, (Date.now() - latestStatusReceivedAt) / 1000);
+    output.textContent = `剩余 ${formatDuration(Math.max(0, status.remaining_seconds - elapsed))}`;
+  } else if (status.stop_reason === "duration_elapsed") {
+    output.textContent = "已按时停止";
+  } else {
+    const minutes = Number($("durationMinutes").value);
+    output.textContent = minutes === 0 ? "不限时" : `计划 ${formatDuration(minutes * 60)}`;
+  }
+}
+
 function applyStatus(status) {
   if (!status) return;
+  if (status !== latestStatus) latestStatusReceivedAt = Date.now();
   latestStatus = status;
   const state = status.state || "未知";
   const pill = $("statePill");
@@ -558,6 +607,7 @@ function applyStatus(status) {
   $("restartCount").textContent = status.restart_count ?? 0;
   $("diskFree").textContent = formatBytes(status.disk && status.disk.free_bytes);
   $("currentControls").textContent = JSON.stringify(status.active_controls || {}, null, 2);
+  renderDurationStatus();
 
   const alert = $("systemAlert");
   alert.textContent = status.last_error || "";
@@ -568,6 +618,9 @@ function applyStatus(status) {
   $("startBtn").disabled = capturing || transitional || $("startBtn").dataset.busy === "true";
   $("stopBtn").disabled = !capturing || $("stopBtn").dataset.busy === "true";
   for (const element of [$("interval"), $("intervalDown"), $("intervalUp"), ...document.querySelectorAll(".interval-preset")]) {
+    element.disabled = capturing;
+  }
+  for (const element of [$("durationMinutes"), ...document.querySelectorAll(".duration-preset")]) {
     element.disabled = capturing;
   }
 }
@@ -623,6 +676,28 @@ function adjustInterval(direction) {
   }
 }
 
+function readDurationSeconds() {
+  const minutes = Number($("durationMinutes").value);
+  if (!Number.isFinite(minutes) || minutes < 0 || minutes > MAX_DURATION_MINUTES) {
+    throw new Error(`自动停止时长必须在 0 到 ${MAX_DURATION_MINUTES} 分钟之间`);
+  }
+  return minutes === 0 ? null : minutes * 60;
+}
+
+function updateDurationUi() {
+  const minutes = Number($("durationMinutes").value);
+  const valid = Number.isFinite(minutes) && minutes >= 0 && minutes <= MAX_DURATION_MINUTES;
+  document.querySelectorAll(".duration-preset").forEach(button => {
+    button.classList.toggle("selected", valid && Number(button.dataset.duration) === minutes);
+  });
+  renderDurationStatus();
+}
+
+function setDurationMinutes(value) {
+  $("durationMinutes").value = String(Math.min(MAX_DURATION_MINUTES, Math.max(0, Number(value))));
+  updateDurationUi();
+}
+
 function updateExposureUi() {
   const manual = $("auto_exposure").value === "1";
   const value = Math.min(2047, Math.max(3, Number($("exposure_time_absolute").value) || 3));
@@ -640,7 +715,11 @@ function updateExposureUi() {
 
 async function startCapture() {
   const interval = readInterval();
-  await api("/api/start", {method:"POST", body:JSON.stringify({interval_seconds:interval})});
+  const duration = readDurationSeconds();
+  await api("/api/start", {method:"POST", body:JSON.stringify({
+    interval_seconds:interval,
+    duration_seconds:duration
+  })});
   await refreshStatus({quiet:true});
 }
 
@@ -702,6 +781,19 @@ document.querySelectorAll(".interval-preset").forEach(button => {
   button.addEventListener("click", () => setIntervalValue(Number(button.dataset.interval)));
 });
 
+$("durationMinutes").addEventListener("input", updateDurationUi);
+$("durationMinutes").addEventListener("change", () => {
+  try {
+    readDurationSeconds();
+    updateDurationUi();
+  } catch (error) {
+    showToast(error.message, "error");
+  }
+});
+document.querySelectorAll(".duration-preset").forEach(button => {
+  button.addEventListener("click", () => setDurationMinutes(Number(button.dataset.duration)));
+});
+
 $("auto_exposure").addEventListener("change", updateExposureUi);
 $("exposureRange").addEventListener("input", () => {
   $("exposure_time_absolute").value = $("exposureRange").value;
@@ -728,6 +820,7 @@ $("saveTokenBtn").addEventListener("click", event => runButton(event.currentTarg
 }).catch(() => {}));
 
 updateIntervalUi();
+updateDurationUi();
 updateExposureUi();
 refreshStatus().catch(() => {
   if (!$("token").value) $("settingsPanel").open = true;
@@ -735,6 +828,7 @@ refreshStatus().catch(() => {
 window.setInterval(() => {
   if (!document.hidden) refreshStatus({quiet:true}).catch(() => {});
 }, 3000);
+window.setInterval(renderDurationStatus, 500);
 </script>
 </body>
 </html>

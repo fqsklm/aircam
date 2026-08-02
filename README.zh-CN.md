@@ -158,6 +158,7 @@ GPIO 输入只允许树莓派安全的 0/3.3V 数字电平。5V、接收机舵�
 ### 6.6 网页临时设置与持久设置的区别
 
 - 网页选择的“拍摄间隔”只用于下一次开始的拍摄任务，不会改写 `config.json`。
+- 网页选择的“自动停止时长”只用于下一次任务；`0` 表示不限时，最长可设置 7 天。倒计时在树莓派本地使用单调时钟运行，Wi-Fi 断开或系统时间校准不会中断或改变时长。
 - 网页应用的曝光、白平衡等控制项会立即生效，但不会改写 `config.json`；服务重启后恢复为 `camera.controls` 中的值。
 - 要让某项参数在重新上电后仍然生效，应把它写入 `config/config.json`。
 - 修改分辨率、帧率、存储路径、服务端口、令牌、自动恢复或 GPIO 参数后，需要检查配置并重启服务。
@@ -193,6 +194,7 @@ http://树莓派IP:8080/
 
 - 开始、结束连续拍照
 - 临时修改拍摄间隔
+- 设置本次任务的自动停止时长并查看剩余时间
 - 设置手动曝光和增益
 - 通过JSON对象设置摄像头支持的任意整数型V4L2参数，例如白平衡、对焦、亮度和对比度
 - 查看摄像头支持的完整参数
@@ -205,7 +207,7 @@ TOKEN='替换成真实令牌'
 curl -H "X-AirCam-Token: $TOKEN" http://aircam.local:8080/api/status
 curl -X POST -H "X-AirCam-Token: $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"interval_seconds":1}' \
+  -d '{"interval_seconds":1,"duration_seconds":600}' \
   http://aircam.local:8080/api/start
 curl -X POST -H "X-AirCam-Token: $TOKEN" \
   -H "Content-Type: application/json" \
@@ -216,6 +218,8 @@ curl -X POST -H "X-AirCam-Token: $TOKEN" \
   -d '{"controls":{"auto_exposure":1,"exposure_time_absolute":100,"gain":0}}' \
   http://aircam.local:8080/api/controls
 ```
+
+API 中的 `duration_seconds` 单位为秒；省略、传入 `null` 或传入 `0` 都表示不限时。到达设定时长后，树莓派会在本地向拍摄进程发送正常停止信号，等待照片文件关闭，并把任务状态改回待机。该过程不依赖网页保持打开或网络连接。
 
 ## 8. 文件结构
 

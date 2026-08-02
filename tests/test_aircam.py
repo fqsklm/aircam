@@ -103,6 +103,18 @@ class AirCamTests(unittest.TestCase):
         with self.assertRaises(aircam.AirCamError):
             aircam.check_number(True, "x", 0.05, 10)
 
+    def test_duration_normalization(self):
+        self.assertIsNone(aircam.normalize_duration_seconds(None))
+        self.assertIsNone(aircam.normalize_duration_seconds(0))
+        self.assertEqual(aircam.normalize_duration_seconds(1.5), 1.5)
+        for invalid in (
+            True,
+            -1,
+            aircam.MAX_CAPTURE_DURATION_SECONDS + 1,
+        ):
+            with self.assertRaises(aircam.AirCamError):
+                aircam.normalize_duration_seconds(invalid)
+
     def test_validate_config_rejects_bad_port(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = config(tmp)
@@ -329,6 +341,48 @@ class AirCamTests(unittest.TestCase):
             service.stop()
             self.assertEqual(service.get_status()["state"], "idle")
 
+    def test_duration_auto_stops_capture_without_remote_command(self):
+        class FakeProcess:
+            pid = 201
+
+            def __init__(self):
+                self.return_code = None
+
+            def poll(self):
+                return self.return_code
+
+        with tempfile.TemporaryDirectory() as tmp:
+            value = config(tmp)
+            Path(value["camera"]["device"]).touch()
+            service = aircam.CameraService(value)
+            process = FakeProcess()
+            service._spawn_ffmpeg = Mock(return_value=process)
+            service._signal_process = lambda target: setattr(
+                target, "return_code", 0
+            )
+
+            started = service.start(0.05, 0.15)
+            self.assertEqual(started["duration_seconds"], 0.15)
+            self.assertIsNotNone(started["remaining_seconds"])
+            self.assertIsNotNone(started["auto_stop_at"])
+
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                if service.get_status()["state"] == "idle":
+                    break
+                time.sleep(0.02)
+            stopped = service.get_status()
+            self.assertEqual(stopped["state"], "idle")
+            self.assertEqual(stopped["stop_reason"], "duration_elapsed")
+            self.assertIsNone(stopped["remaining_seconds"])
+            self.assertIsNotNone(stopped["stopped_at"])
+
+            session = json.loads(
+                (Path(tmp) / "photos" / stopped["session"] / "session.json")
+                .read_text(encoding="utf-8")
+            )
+            self.assertEqual(session["duration_seconds"], 0.15)
+
     def test_http_api_requires_token_and_returns_status(self):
         with tempfile.TemporaryDirectory() as tmp:
             value = config(tmp)
@@ -365,7 +419,9 @@ class AirCamTests(unittest.TestCase):
                 start_request = urllib.request.Request(
                     base + "/api/start",
                     method="POST",
-                    data=json.dumps({"interval_seconds": 0.5}).encode(),
+                    data=json.dumps(
+                        {"interval_seconds": 0.5, "duration_seconds": 120}
+                    ).encode(),
                     headers={
                         "X-AirCam-Token": "test",
                         "Content-Type": "application/json",
@@ -373,7 +429,7 @@ class AirCamTests(unittest.TestCase):
                 )
                 with urllib.request.urlopen(start_request, timeout=2) as response:
                     self.assertTrue(json.loads(response.read())["ok"])
-                camera.start.assert_called_once_with(0.5)
+                camera.start.assert_called_once_with(0.5, 120)
 
                 stop_request = urllib.request.Request(
                     base + "/api/stop",
@@ -409,6 +465,10 @@ class AirCamTests(unittest.TestCase):
         self.assertIn("最小 0.0334 秒", page)
         self.assertIn("function adjustInterval", page)
         self.assertIn("function runButton", page)
+        self.assertIn('id="durationMinutes"', page)
+        self.assertIn('id="durationRemaining"', page)
+        self.assertIn("duration_seconds:duration", page)
+        self.assertIn("function renderDurationStatus", page)
         self.assertIn('button.disabled = false;', page)
         self.assertIn('aria-live="polite"', page)
         self.assertNotIn('class="brand-mark"', page)
