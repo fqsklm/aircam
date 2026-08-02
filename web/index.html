@@ -514,6 +514,7 @@ async function runButton(button, busyText, confirmedText, task) {
     throw error;
   } finally {
     button.dataset.busy = "false";
+    button.disabled = false;
     button.classList.remove("busy", "confirmed", "failed");
     button.textContent = originalText;
     applyStatus(latestStatus);
