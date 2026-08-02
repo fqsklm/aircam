@@ -16,11 +16,13 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
 import threading
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -41,6 +43,9 @@ TIMED_PHOTO = re.compile(
     r"^photo_\d{8}T\d{6}\.\d{6}Z_(\d{8})\.jpg$"
 )
 LEGACY_PHOTO = re.compile(r"^photo_(\d{8})\.jpg$")
+SESSION_NAME = re.compile(r"^\d{8}_\d{6}(?:_\d+)?$")
+DOWNLOAD_TICKET_TTL_SECONDS = 60
+CLEAR_ALL_CONFIRMATION = "清空全部照片"
 
 
 class AirCamError(RuntimeError):
@@ -218,6 +223,8 @@ class CameraService:
         self.worker: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.stop_deadline_monotonic: float | None = None
+        self.export_active = False
+        self.export_session_name: str | None = None
         self.session_dir: Path | None = None
         self.manifested_photos: set[str] = set()
         self.frame_timestamps_us: dict[str, int] = {}
@@ -640,6 +647,8 @@ class CameraService:
         duration_seconds: Any = None,
     ) -> dict[str, Any]:
         with self.lock:
+            if self.export_active:
+                raise AirCamError("照片正在导入电脑，请等待下载完成后再开始拍照")
             if self._is_running() or self.status.state in {
                 "starting",
                 "recovering",
@@ -993,6 +1002,7 @@ class CameraService:
             }
             status["device"] = self.device
             status["active_controls"] = dict(self.active_controls)
+            status["export_active"] = self.export_active
             deadline = self.stop_deadline_monotonic
             status["remaining_seconds"] = (
                 max(0.0, deadline - time.monotonic())
@@ -1002,6 +1012,140 @@ class CameraService:
                 else None
             )
             return status
+
+    def _capture_is_busy(self) -> bool:
+        return self._is_running() or self.status.state in {
+            "starting",
+            "capturing",
+            "recovering",
+            "stopping",
+        }
+
+    def _require_storage_idle(self) -> None:
+        if self._capture_is_busy():
+            raise AirCamError("拍摄进行中，结束拍照后才能导入或清理照片")
+        if self.export_active:
+            raise AirCamError("照片正在导入电脑，请等待下载完成")
+
+    def _resolve_session_dir(self, session_name: str) -> Path:
+        if not isinstance(session_name, str) or not SESSION_NAME.fullmatch(
+            session_name
+        ):
+            raise AirCamError("任务编号格式无效")
+        data_root = self.data_dir.resolve()
+        candidate = self.data_dir / session_name
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise AirCamError("任务不存在或已经被清理") from exc
+        if resolved.parent != data_root or not resolved.is_dir() or candidate.is_symlink():
+            raise AirCamError("任务目录无效")
+        return resolved
+
+    @staticmethod
+    def _session_size(session_dir: Path) -> int:
+        total = 0
+        for path in session_dir.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                try:
+                    total += path.stat().st_size
+                except FileNotFoundError:
+                    continue
+        return total
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        with self.lock:
+            active_session = self.status.session
+            sessions: list[dict[str, Any]] = []
+            try:
+                candidates = sorted(self.data_dir.iterdir(), reverse=True)
+            except FileNotFoundError:
+                candidates = []
+            for session_dir in candidates:
+                if (
+                    not session_dir.is_dir()
+                    or session_dir.is_symlink()
+                    or not SESSION_NAME.fullmatch(session_dir.name)
+                ):
+                    continue
+                metadata: dict[str, Any] = {}
+                metadata_path = session_dir / "session.json"
+                try:
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                except (FileNotFoundError, json.JSONDecodeError, OSError):
+                    metadata = {}
+                photos = 0
+                for photo in session_dir.glob("photo_*.jpg"):
+                    try:
+                        if photo.is_file() and photo.stat().st_size > 0:
+                            photos += 1
+                    except FileNotFoundError:
+                        continue
+                sessions.append(
+                    {
+                        "session": session_dir.name,
+                        "started_at": metadata.get("started_at"),
+                        "duration_seconds": metadata.get("duration_seconds"),
+                        "interval_seconds": metadata.get("interval_seconds"),
+                        "photo_count": photos,
+                        "size_bytes": self._session_size(session_dir),
+                        "active": session_dir.name == active_session
+                        and self._capture_is_busy(),
+                    }
+                )
+            return sessions
+
+    def begin_export(self, session_name: str) -> Path:
+        with self.lock:
+            self._require_storage_idle()
+            session_dir = self._resolve_session_dir(session_name)
+            self.export_active = True
+            self.export_session_name = session_name
+            return session_dir
+
+    def finish_export(self) -> None:
+        with self.lock:
+            self.export_active = False
+            self.export_session_name = None
+
+    def validate_export_session(self, session_name: str) -> None:
+        with self.lock:
+            self._require_storage_idle()
+            self._resolve_session_dir(session_name)
+
+    def delete_session(self, session_name: str) -> dict[str, Any]:
+        with self.lock:
+            self._require_storage_idle()
+            session_dir = self._resolve_session_dir(session_name)
+            shutil.rmtree(session_dir)
+            if self.status.session == session_name:
+                self.status = CaptureStatus()
+                self.session_dir = None
+                self._save_state()
+            return {"deleted_session": session_name}
+
+    def clear_sessions(self) -> dict[str, Any]:
+        with self.lock:
+            self._require_storage_idle()
+            deleted_sessions = 0
+            try:
+                candidates = list(self.data_dir.iterdir())
+            except FileNotFoundError:
+                candidates = []
+            for candidate in candidates:
+                if (
+                    candidate.is_dir()
+                    and not candidate.is_symlink()
+                    and SESSION_NAME.fullmatch(candidate.name)
+                ):
+                    shutil.rmtree(candidate)
+                    deleted_sessions += 1
+            self.status = CaptureStatus()
+            self.session_dir = None
+            self._save_state()
+            return {"deleted_sessions": deleted_sessions}
 
     def latest_photo(self) -> Path | None:
         with self.lock:
@@ -1100,8 +1244,37 @@ class GpioTrigger:
             self.device.close()
 
 
+class ChunkedWriter:
+    """Write an HTTP/1.1 chunked response body to a buffered socket."""
+
+    def __init__(self, output: Any) -> None:
+        self.output = output
+        self.finished = False
+
+    def write(self, data: bytes) -> int:
+        if self.finished:
+            raise ValueError("cannot write after the final HTTP chunk")
+        if not data:
+            return 0
+        self.output.write(f"{len(data):X}\r\n".encode("ascii"))
+        self.output.write(data)
+        self.output.write(b"\r\n")
+        return len(data)
+
+    def flush(self) -> None:
+        self.output.flush()
+
+    def finish(self) -> None:
+        if self.finished:
+            return
+        self.output.write(b"0\r\n\r\n")
+        self.output.flush()
+        self.finished = True
+
+
 class AirCamHandler(BaseHTTPRequestHandler):
-    server_version = "AirCam/0.3.0"
+    server_version = "AirCam/0.4.0"
+    protocol_version = "HTTP/1.1"
 
     @property
     def app(self) -> "AirCamHttpServer":
@@ -1154,6 +1327,57 @@ class AirCamHandler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "令牌错误"})
         return False
 
+    def _stream_session_zip(self, ticket: str) -> None:
+        session_name = self.app.consume_download_ticket(ticket)
+        session_dir: Path | None = None
+        response_started = False
+        transfer_finished = False
+        try:
+            session_dir = self.app.camera.begin_export(session_name)
+            filename = f"AirCam_{session_name}.zip"
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{filename}"'
+            )
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            response_started = True
+            chunked_output = ChunkedWriter(self.wfile)
+            with zipfile.ZipFile(
+                chunked_output,
+                mode="w",
+                compression=zipfile.ZIP_STORED,
+                allowZip64=True,
+            ) as archive:
+                for path in sorted(session_dir.rglob("*")):
+                    if (
+                        path.is_file()
+                        and not path.is_symlink()
+                        and not path.name.startswith("pending_")
+                    ):
+                        relative = path.relative_to(session_dir)
+                        archive.write(
+                            path,
+                            arcname=f"{session_name}/{relative.as_posix()}",
+                        )
+            chunked_output.finish()
+            transfer_finished = True
+            LOG.info("download completed: session=%s", session_name)
+        except (BrokenPipeError, ConnectionResetError):
+            LOG.warning("download interrupted: session=%s", session_name)
+        except Exception:
+            if not response_started:
+                raise
+            LOG.exception("download failed after response started: session=%s", session_name)
+        finally:
+            if session_dir is not None:
+                self.app.camera.finish_export()
+            if response_started and not transfer_finished:
+                self.close_connection = True
+
     def do_GET(self) -> None:
         path = urlparse(self.path).path
         try:
@@ -1165,6 +1389,10 @@ class AirCamHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(data)
+                return
+            download_match = re.fullmatch(r"/api/download/([A-Za-z0-9_-]+)", path)
+            if download_match:
+                self._stream_session_zip(download_match.group(1))
                 return
             if not self._require_auth():
                 return
@@ -1196,6 +1424,11 @@ class AirCamHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(data)
+            elif path == "/api/sessions":
+                self._json(
+                    HTTPStatus.OK,
+                    {"ok": True, "sessions": self.app.camera.list_sessions()},
+                )
             else:
                 self._json(
                     HTTPStatus.NOT_FOUND, {"ok": False, "error": "接口不存在"}
@@ -1229,10 +1462,39 @@ class AirCamHandler(BaseHTTPRequestHandler):
                     payload.get("controls", {})
                 )
                 self._json(HTTPStatus.OK, {"ok": True, "controls": results})
+            elif path == "/api/sessions/clear":
+                if payload.get("confirm_text") != CLEAR_ALL_CONFIRMATION:
+                    raise AirCamError(
+                        f"请输入“{CLEAR_ALL_CONFIRMATION}”确认清理全部任务"
+                    )
+                result = self.app.camera.clear_sessions()
+                self._json(HTTPStatus.OK, {"ok": True, **result})
             else:
-                self._json(
-                    HTTPStatus.NOT_FOUND, {"ok": False, "error": "接口不存在"}
+                session_action = re.fullmatch(
+                    r"/api/sessions/([^/]+)/(download-ticket|delete)", path
                 )
+                if not session_action:
+                    self._json(
+                        HTTPStatus.NOT_FOUND,
+                        {"ok": False, "error": "接口不存在"},
+                    )
+                    return
+                session_name, action = session_action.groups()
+                if action == "download-ticket":
+                    ticket = self.app.issue_download_ticket(session_name)
+                    self._json(
+                        HTTPStatus.OK,
+                        {
+                            "ok": True,
+                            "download_url": f"/api/download/{ticket}",
+                            "expires_in_seconds": DOWNLOAD_TICKET_TTL_SECONDS,
+                        },
+                    )
+                else:
+                    if payload.get("confirm_session") != session_name:
+                        raise AirCamError("确认的任务编号不匹配")
+                    result = self.app.camera.delete_session(session_name)
+                    self._json(HTTPStatus.OK, {"ok": True, **result})
         except AirCamError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
         except Exception:
@@ -1256,7 +1518,32 @@ class AirCamHttpServer(ThreadingHTTPServer):
         self.camera = camera
         self.config = config
         self.index_path = index_path
+        self.download_ticket_lock = threading.Lock()
+        self.download_tickets: dict[str, tuple[float, str]] = {}
         super().__init__(address, AirCamHandler)
+
+    def issue_download_ticket(self, session_name: str) -> str:
+        self.camera.validate_export_session(session_name)
+        ticket = secrets.token_urlsafe(24)
+        now = time.monotonic()
+        with self.download_ticket_lock:
+            self.download_tickets = {
+                value: details
+                for value, details in self.download_tickets.items()
+                if details[0] > now
+            }
+            self.download_tickets[ticket] = (
+                now + DOWNLOAD_TICKET_TTL_SECONDS,
+                session_name,
+            )
+        return ticket
+
+    def consume_download_ticket(self, ticket: str) -> str:
+        with self.download_ticket_lock:
+            details = self.download_tickets.pop(ticket, None)
+        if details is None or details[0] <= time.monotonic():
+            raise AirCamError("下载链接无效或已经过期，请重新点击导入电脑")
+        return details[1]
 
 
 def parse_args() -> argparse.Namespace:
