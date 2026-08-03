@@ -23,9 +23,8 @@ install -d -o pi -g pi -m 0755 \
   /home/pi/AirCam /home/pi/AirCam/web /home/pi/AirCam/scripts \
   /home/pi/AirCam/systemd
 install -d -o pi -g aircam -m 0750 /home/pi/AirCam/config
-install -d -o pi -g pi -m 0755 /home/pi/Pictures
-install -d -o aircam -g pi -m 2770 /home/pi/Pictures/AirCam
-setfacl -m u:aircam:--x /home/pi /home/pi/Pictures
+install -d -o aircam -g pi -m 2770 /home/pi/AirCam/pictures
+setfacl -m u:aircam:--x /home/pi
 if [[ "$project_dir" != "/home/pi/AirCam" ]]; then
   install -o pi -g pi -m 0755 "$project_dir/aircam.py" /home/pi/AirCam/aircam.py
   install -o pi -g pi -m 0644 "$project_dir/web/index.html" /home/pi/AirCam/web/index.html

@@ -16,7 +16,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=false
 ProtectSystem=strict
-ReadWritePaths=/home/pi/Pictures/AirCam
+ReadWritePaths=/home/pi/AirCam/pictures
 
 [Install]
 WantedBy=multi-user.target

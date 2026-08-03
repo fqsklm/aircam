@@ -10,6 +10,7 @@ camera-report.txt
 *.log
 *.tar.gz
 photos/
+pictures/
 captures/
 *.jpg
 *.jpeg

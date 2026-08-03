@@ -20,7 +20,7 @@
     "restart_delay_seconds": 2
   },
   "storage": {
-    "data_dir": "/home/pi/Pictures/AirCam",
+    "data_dir": "/home/pi/AirCam/pictures",
     "min_free_mb": 512
   },
   "server": {
