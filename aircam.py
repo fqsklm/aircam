@@ -19,6 +19,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -1508,6 +1509,15 @@ class AirCamHandler(BaseHTTPRequestHandler):
 class AirCamHttpServer(ThreadingHTTPServer):
     daemon_threads = True
 
+    def server_bind(self) -> None:
+        if self.address_family == socket.AF_INET6:
+            self.socket.setsockopt(
+                socket.IPPROTO_IPV6,
+                socket.IPV6_V6ONLY,
+                0,
+            )
+        super().server_bind()
+
     def __init__(
         self,
         address: tuple[str, int],
@@ -1520,7 +1530,11 @@ class AirCamHttpServer(ThreadingHTTPServer):
         self.index_path = index_path
         self.download_ticket_lock = threading.Lock()
         self.download_tickets: dict[str, tuple[float, str]] = {}
-        super().__init__(address, AirCamHandler)
+        bind_address = address
+        if address[0] == "0.0.0.0" and socket.has_dualstack_ipv6():
+            self.address_family = socket.AF_INET6
+            bind_address = ("::", address[1])
+        super().__init__(bind_address, AirCamHandler)
 
     def issue_download_ticket(self, session_name: str) -> str:
         self.camera.validate_export_session(session_name)

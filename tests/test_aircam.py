@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import socket
 import tempfile
 import threading
 import time
@@ -43,6 +44,30 @@ def config(root: str) -> dict:
 
 
 class AirCamTests(unittest.TestCase):
+    def test_http_server_uses_dual_stack_for_ipv4_wildcard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            value = config(tmp)
+            camera = Mock()
+            index = Path(tmp) / "index.html"
+            index.write_text("<p>AirCam</p>", encoding="utf-8")
+
+            with patch("aircam.socket.has_dualstack_ipv6", return_value=True):
+                server = aircam.AirCamHttpServer(
+                    ("0.0.0.0", 0), camera, value, index
+                )
+            try:
+                self.assertEqual(server.address_family, socket.AF_INET6)
+                self.assertEqual(server.server_address[0], "::")
+                self.assertEqual(
+                    server.socket.getsockopt(
+                        socket.IPPROTO_IPV6,
+                        socket.IPV6_V6ONLY,
+                    ),
+                    0,
+                )
+            finally:
+                server.server_close()
+
     def test_chunked_writer_sends_an_explicit_final_chunk(self):
         output = io.BytesIO()
         writer = aircam.ChunkedWriter(output)
