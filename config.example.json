@@ -34,5 +34,31 @@
     "active_high": true,
     "pull_up": null,
     "bounce_time": 0.15
+  },
+  "pwm": {
+    "enabled": false,
+    "bcm_pin": 17,
+    "gpiochip": 4,
+    "start_pwm": 1700,
+    "stop_pwm": 1300,
+    "min_valid_pwm": 750,
+    "max_valid_pwm": 2250,
+    "debounce_seconds": 0.15,
+    "min_stable_pulses": 5,
+    "timeout_seconds": 0.5,
+    "stop_on_timeout": true
+  },
+  "mavlink": {
+    "enabled": false,
+    "device": "/dev/serial0",
+    "baud": 115200,
+    "rc_channel": 9,
+    "start_pwm": 1700,
+    "stop_pwm": 1300,
+    "debounce_seconds": 0.15,
+    "timeout_seconds": 2.0,
+    "stop_on_timeout": true,
+    "reconnect_seconds": 2.0,
+    "request_rate_hz": 10
   }
 }

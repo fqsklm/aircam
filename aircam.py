@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""AirCam: a small, dependency-free control service for a V4L2 USB camera.
+"""AirCam: a small control service for a V4L2 USB camera.
 
 The service delegates camera capture and controls to ffmpeg and v4l2-ctl.  It
-provides an authenticated HTTP API, a small web UI, and an optional GPIO
-start/stop input.
+provides an authenticated HTTP API, a small web UI, and optional GPIO or
+MAVLink RC-channel start/stop inputs.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hmac
 import json
@@ -20,6 +21,7 @@ import secrets
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -35,6 +37,13 @@ from urllib.parse import urlparse
 
 LOG = logging.getLogger("aircam")
 CONTROL_NAME = re.compile(r"^[A-Za-z0-9_]+$")
+V4L2_CONTROL_LINE = re.compile(
+    r"^\s*([A-Za-z0-9_]+)\s+0x[0-9A-Fa-f]+\s+\(([^)]+)\)\s*:\s*(.*)$"
+)
+V4L2_MENU_LINE = re.compile(r"^\s+(-?\d+):\s*(.+?)\s*$")
+V4L2_NUMERIC_FIELD = re.compile(
+    r"(?:^|\s)(min|max|step|default|value)=(-?\d+)(?=\s|$)"
+)
 MIN_CAPTURE_INTERVAL_SECONDS = 0.0334
 MAX_CAPTURE_DURATION_SECONDS = 7 * 24 * 60 * 60
 SHOWINFO_TIMEBASE = re.compile(r"config in time_base:\s*(\d+)/(\d+)")
@@ -47,6 +56,16 @@ LEGACY_PHOTO = re.compile(r"^photo_(\d{8})\.jpg$")
 SESSION_NAME = re.compile(r"^\d{8}_\d{6}(?:_\d+)?$")
 DOWNLOAD_TICKET_TTL_SECONDS = 60
 CLEAR_ALL_CONFIRMATION = "清空全部照片"
+MAVLINK_V1_MAGIC = 0xFE
+MAVLINK_V2_MAGIC = 0xFD
+MAVLINK_V2_SIGNED_FLAG = 0x01
+MAVLINK_HEARTBEAT_ID = 0
+MAVLINK_HEARTBEAT_CRC_EXTRA = 50
+MAVLINK_RC_CHANNELS_ID = 65
+MAVLINK_RC_CHANNELS_CRC_EXTRA = 118
+MAVLINK_COMMAND_LONG_ID = 76
+MAVLINK_COMMAND_LONG_CRC_EXTRA = 152
+MAV_CMD_SET_MESSAGE_INTERVAL = 511
 
 
 class AirCamError(RuntimeError):
@@ -152,6 +171,135 @@ def validate_config(config: dict[str, Any]) -> None:
     if not isinstance(server.get("token", ""), str):
         raise AirCamError("server.token 必须是字符串")
 
+    pwm = config.get("pwm", {})
+    if not isinstance(pwm, dict):
+        raise AirCamError("pwm 必须是对象")
+    if not isinstance(pwm.get("enabled", False), bool):
+        raise AirCamError("pwm.enabled 必须是布尔值")
+    bcm_pin = pwm.get("bcm_pin", 17)
+    if (
+        isinstance(bcm_pin, bool)
+        or not isinstance(bcm_pin, int)
+        or not 0 <= bcm_pin <= 27
+    ):
+        raise AirCamError("pwm.bcm_pin 必须是 0 到 27 的整数")
+    gpiochip = pwm.get("gpiochip", 4)
+    if (
+        isinstance(gpiochip, bool)
+        or not isinstance(gpiochip, int)
+        or not 0 <= gpiochip <= 15
+    ):
+        raise AirCamError("pwm.gpiochip 必须是 0 到 15 的整数")
+    pwm_start = pwm.get("start_pwm", 1700)
+    pwm_stop = pwm.get("stop_pwm", 1300)
+    pwm_min = pwm.get("min_valid_pwm", 750)
+    pwm_max = pwm.get("max_valid_pwm", 2250)
+    for value, name in (
+        (pwm_start, "start_pwm"),
+        (pwm_stop, "stop_pwm"),
+        (pwm_min, "min_valid_pwm"),
+        (pwm_max, "max_valid_pwm"),
+    ):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 500 <= value <= 2500
+        ):
+            raise AirCamError(f"pwm.{name} 必须是 500 到 2500 的整数")
+    if not pwm_min <= pwm_stop < pwm_start <= pwm_max:
+        raise AirCamError(
+            "PWM 阈值必须满足 min_valid_pwm <= stop_pwm < start_pwm <= max_valid_pwm"
+        )
+    check_number(
+        pwm.get("debounce_seconds", 0.15),
+        "pwm.debounce_seconds",
+        0,
+        5,
+    )
+    check_number(
+        pwm.get("timeout_seconds", 0.5),
+        "pwm.timeout_seconds",
+        0.1,
+        10,
+    )
+    if not isinstance(pwm.get("stop_on_timeout", True), bool):
+        raise AirCamError("pwm.stop_on_timeout 必须是布尔值")
+    min_stable_pulses = pwm.get("min_stable_pulses", 5)
+    if (
+        isinstance(min_stable_pulses, bool)
+        or not isinstance(min_stable_pulses, int)
+        or not 2 <= min_stable_pulses <= 50
+    ):
+        raise AirCamError("pwm.min_stable_pulses 必须是 2 到 50 的整数")
+
+    mavlink = config.get("mavlink", {})
+    if not isinstance(mavlink, dict):
+        raise AirCamError("mavlink 必须是对象")
+    if not isinstance(mavlink.get("enabled", False), bool):
+        raise AirCamError("mavlink.enabled 必须是布尔值")
+    device = mavlink.get("device", "/dev/serial0")
+    if not isinstance(device, str) or not device:
+        raise AirCamError("mavlink.device 必须是非空路径")
+    baud = mavlink.get("baud", 115200)
+    if (
+        isinstance(baud, bool)
+        or not isinstance(baud, int)
+        or not 1200 <= baud <= 3_000_000
+    ):
+        raise AirCamError("mavlink.baud 必须是 1200 到 3000000 的整数")
+    rc_channel = mavlink.get("rc_channel", 9)
+    if (
+        isinstance(rc_channel, bool)
+        or not isinstance(rc_channel, int)
+        or not 1 <= rc_channel <= 18
+    ):
+        raise AirCamError("mavlink.rc_channel 必须是 1 到 18 的整数")
+    start_pwm = mavlink.get("start_pwm", 1700)
+    stop_pwm = mavlink.get("stop_pwm", 1300)
+    for value, name in ((start_pwm, "start_pwm"), (stop_pwm, "stop_pwm")):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 800 <= value <= 2200
+        ):
+            raise AirCamError(f"mavlink.{name} 必须是 800 到 2200 的整数")
+    if stop_pwm >= start_pwm:
+        raise AirCamError("mavlink.stop_pwm 必须小于 mavlink.start_pwm")
+    check_number(
+        mavlink.get("debounce_seconds", 0.15),
+        "mavlink.debounce_seconds",
+        0,
+        5,
+    )
+    check_number(
+        mavlink.get("timeout_seconds", 2),
+        "mavlink.timeout_seconds",
+        0.5,
+        60,
+    )
+    check_number(
+        mavlink.get("reconnect_seconds", 2),
+        "mavlink.reconnect_seconds",
+        0.1,
+        60,
+    )
+    request_rate_hz = mavlink.get("request_rate_hz", 10)
+    if (
+        isinstance(request_rate_hz, bool)
+        or not isinstance(request_rate_hz, int)
+        or not 1 <= request_rate_hz <= 50
+    ):
+        raise AirCamError("mavlink.request_rate_hz 必须是 1 到 50 的整数")
+    if not isinstance(mavlink.get("stop_on_timeout", True), bool):
+        raise AirCamError("mavlink.stop_on_timeout 必须是布尔值")
+
+    enabled_triggers = sum(
+        bool(config.get(section, {}).get("enabled", False))
+        for section in ("gpio", "pwm", "mavlink")
+    )
+    if enabled_triggers > 1:
+        raise AirCamError("gpio、pwm、mavlink 触发方式最多只能启用一种")
+
 
 def check_number(
     value: Any, name: str, minimum: float, maximum: float
@@ -230,10 +378,21 @@ class CameraService:
         self.manifested_photos: set[str] = set()
         self.frame_timestamps_us: dict[str, int] = {}
         self.ffmpeg_reader_threads: dict[int, threading.Thread] = {}
-        self.active_controls: dict[str, Any] = dict(
+        self.configured_controls: dict[str, int | bool] = dict(
             config["camera"].get("controls", {})
         )
+        # Requested values are kept separately from hardware-confirmed values.
+        # The latter are populated only by a V4L2 readback.
+        self.active_controls: dict[str, int | bool] = dict(
+            self.configured_controls
+        )
+        self.effective_controls: dict[str, int] = {}
+        self.control_metadata: dict[str, dict[str, Any]] = {}
+        self.controls_read_at: str | None = None
         self.control_history: list[tuple[float, dict[str, Any]]] = []
+        self.photo_count = 0
+        self.next_pending_number = 1
+        self.legacy_scan_complete = False
         self.status = CaptureStatus()
         self.data_dir = Path(config["storage"]["data_dir"])
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -310,7 +469,40 @@ class CameraService:
             str(output_pattern),
         ]
 
-    def list_controls(self) -> str:
+    @staticmethod
+    def parse_control_listing(raw: str) -> dict[str, dict[str, Any]]:
+        controls: dict[str, dict[str, Any]] = {}
+        current_menu: dict[str, Any] | None = None
+        for line in raw.splitlines():
+            match = V4L2_CONTROL_LINE.match(line)
+            if match:
+                name, control_type, details = match.groups()
+                item: dict[str, Any] = {
+                    "name": name,
+                    "type": control_type,
+                    "menu": {},
+                    "flags": [],
+                }
+                for field, value in V4L2_NUMERIC_FIELD.findall(details):
+                    item[field] = int(value)
+                flags_match = re.search(r"(?:^|\s)flags=(.+)$", details)
+                if flags_match:
+                    item["flags"] = [
+                        value.strip()
+                        for value in flags_match.group(1).split(",")
+                        if value.strip()
+                    ]
+                controls[name] = item
+                current_menu = item if "menu" in control_type else None
+                continue
+
+            menu_match = V4L2_MENU_LINE.match(line)
+            if menu_match and current_menu is not None:
+                value, label = menu_match.groups()
+                current_menu["menu"][value] = label
+        return controls
+
+    def read_control_state(self) -> dict[str, Any]:
         result = self.run(
             ["v4l2-ctl", "-d", self.device, "--list-ctrls-menus"],
             text=True,
@@ -322,25 +514,138 @@ class CameraService:
             raise AirCamError(
                 (result.stderr or result.stdout or "无法读取摄像头控制项").strip()
             )
-        return result.stdout
+        metadata = self.parse_control_listing(result.stdout)
+        effective = {
+            name: int(item["value"])
+            for name, item in metadata.items()
+            if "value" in item and "inactive" not in item.get("flags", [])
+        }
+        read_at = utc_now()
+        with self.lock:
+            self.control_metadata = metadata
+            self.effective_controls = effective
+            self.controls_read_at = read_at
+            requested = dict(self.active_controls)
+            configured = dict(self.configured_controls)
+        return {
+            "raw": result.stdout,
+            "controls": metadata,
+            "effective_controls": effective,
+            "requested_controls": requested,
+            "configured_controls": configured,
+            "read_at": read_at,
+        }
 
-    def set_controls(self, controls: dict[str, Any]) -> list[dict[str, Any]]:
+    def list_controls(self) -> str:
+        return str(self.read_control_state()["raw"])
+
+    @staticmethod
+    def _normalize_control_values(
+        controls: dict[str, Any],
+    ) -> dict[str, int]:
         if not isinstance(controls, dict) or not controls:
             raise AirCamError("controls 必须是非空对象")
+        normalized: dict[str, int] = {}
+        for name, raw_value in controls.items():
+            if not CONTROL_NAME.fullmatch(name):
+                raise AirCamError(f"非法控制项名称：{name}")
+            if isinstance(raw_value, bool):
+                value = int(raw_value)
+            elif isinstance(raw_value, int):
+                value = raw_value
+            else:
+                raise AirCamError(f"{name} 的值必须是整数或布尔值")
+            normalized[name] = value
+        return normalized
+
+    @staticmethod
+    def _validate_control_values(
+        controls: dict[str, int], metadata: dict[str, dict[str, Any]]
+    ) -> None:
+        for name, value in controls.items():
+            item = metadata.get(name)
+            if item is None:
+                raise AirCamError(f"摄像头不支持控制项：{name}")
+            minimum = item.get("min")
+            maximum = item.get("max")
+            if minimum is not None and value < minimum:
+                raise AirCamError(f"{name} 不能小于 {minimum}")
+            if maximum is not None and value > maximum:
+                raise AirCamError(f"{name} 不能大于 {maximum}")
+            step = item.get("step")
+            if (
+                step is not None
+                and step > 0
+                and minimum is not None
+                and (value - minimum) % step != 0
+            ):
+                raise AirCamError(
+                    f"{name} 必须从 {minimum} 起按步长 {step} 取值"
+                )
+            menu = item.get("menu", {})
+            if menu and str(value) not in menu:
+                raise AirCamError(f"{name} 不支持值 {value}")
+
+    def initialize_controls(self) -> dict[str, Any]:
+        if self.active_controls:
+            self.set_controls(dict(self.active_controls))
+            return self.control_state()
+        return self.read_control_state()
+
+    def control_state(self) -> dict[str, Any]:
+        """Return the last hardware readback without invoking v4l2-ctl."""
 
         with self.lock:
-            results: list[dict[str, Any]] = []
-            successful: dict[str, int] = {}
-            for name, raw_value in controls.items():
-                if not CONTROL_NAME.fullmatch(name):
-                    raise AirCamError(f"非法控制项名称：{name}")
-                if isinstance(raw_value, bool):
-                    value = int(raw_value)
-                elif isinstance(raw_value, int):
-                    value = raw_value
-                else:
-                    raise AirCamError(f"{name} 的值必须是整数或布尔值")
+            return {
+                "controls": copy.deepcopy(self.control_metadata),
+                "effective_controls": dict(self.effective_controls),
+                "requested_controls": dict(self.active_controls),
+                "configured_controls": dict(self.configured_controls),
+                "read_at": self.controls_read_at,
+            }
 
+    def _rollback_controls(
+        self,
+        successful_names: list[str],
+        previous_values: dict[str, Any],
+    ) -> list[str]:
+        rollback_errors: list[str] = []
+        for name in reversed(successful_names):
+            previous = previous_values.get(name)
+            if previous is None:
+                continue
+            rollback = self.run(
+                [
+                    "v4l2-ctl",
+                    "-d",
+                    self.device,
+                    "-c",
+                    f"{name}={previous}",
+                ],
+                text=True,
+                capture_output=True,
+                timeout=8,
+                check=False,
+            )
+            if rollback.returncode != 0:
+                rollback_errors.append(name)
+        return rollback_errors
+
+    def set_controls(self, controls: dict[str, Any]) -> list[dict[str, Any]]:
+        normalized = self._normalize_control_values(controls)
+        with self.lock:
+            before = self.read_control_state()
+            metadata = before["controls"]
+            self._validate_control_values(normalized, metadata)
+            previous_values = {
+                name: metadata[name].get("value") for name in normalized
+            }
+            results: list[dict[str, Any]] = []
+            successful_names: list[str] = []
+            failure_message: str | None = None
+            ordered = list(normalized.items())
+            ordered.sort(key=lambda item: 0 if item[0] == "auto_exposure" else 1)
+            for name, value in ordered:
                 result = self.run(
                     ["v4l2-ctl", "-d", self.device, "-c", f"{name}={value}"],
                     text=True,
@@ -354,28 +659,73 @@ class CameraService:
                     "ok": result.returncode == 0,
                 }
                 if result.returncode != 0:
-                    item["error"] = (
+                    failure_message = (
                         result.stderr or result.stdout or "设置失败"
                     ).strip()
+                    item["error"] = failure_message
                 else:
-                    successful[name] = value
+                    successful_names.append(name)
                 results.append(item)
+                if failure_message is not None:
+                    break
 
-            if successful:
-                self.active_controls.update(successful)
-                self._record_control_event(time.time())
-
-            failures = [item for item in results if not item["ok"]]
-            if failures:
-                messages = "; ".join(
-                    f"{item['name']}: {item.get('error', '设置失败')}"
-                    for item in failures
+            if failure_message is not None:
+                rollback_errors = self._rollback_controls(
+                    successful_names, previous_values
                 )
-                raise AirCamError(messages)
+                final_state = self.read_control_state()
+                failed = next(item for item in results if not item["ok"])
+                message = f"{failed['name']}: {failure_message}"
+                if rollback_errors:
+                    message += (
+                        "；回滚失败：" + ", ".join(rollback_errors)
+                        + "；最终硬件值："
+                        + json.dumps(
+                            final_state["effective_controls"],
+                            ensure_ascii=False,
+                        )
+                    )
+                else:
+                    message += "；已回滚先前成功的参数"
+                raise AirCamError(message)
+
+            final_state = self.read_control_state()
+            mismatches: list[str] = []
+            for name, requested in normalized.items():
+                item = final_state["controls"].get(name, {})
+                if item.get("value") != requested:
+                    mismatches.append(
+                        f"{name} 请求 {requested}、读回 {item.get('value')}"
+                    )
+            if mismatches:
+                rollback_errors = self._rollback_controls(
+                    successful_names, previous_values
+                )
+                rolled_back_state = self.read_control_state()
+                message = "；".join(mismatches) + "；设置未生效"
+                if rollback_errors:
+                    message += "；回滚失败：" + ", ".join(rollback_errors)
+                else:
+                    message += "；已恢复设置前的硬件值"
+                message += "；最终硬件值：" + json.dumps(
+                    rolled_back_state["effective_controls"], ensure_ascii=False
+                )
+                raise AirCamError(message)
+
+            self.active_controls.update(normalized)
+            # Automatic modes commonly make their paired manual controls
+            # inactive. Do not retain those stale manual values for the next
+            # capture start/recovery, or reapplying them will fail even though
+            # switching to automatic mode itself succeeded.
+            for name in list(self.active_controls):
+                item = final_state["controls"].get(name)
+                if item is not None and "inactive" in item.get("flags", []):
+                    self.active_controls.pop(name, None)
+            self._record_control_event(time.time())
             return results
 
     def _record_control_event(self, timestamp: float) -> None:
-        snapshot = dict(self.active_controls)
+        snapshot = dict(self.effective_controls)
         self.control_history.append((timestamp, snapshot))
         if (
             self.session_dir is None
@@ -402,7 +752,7 @@ class CameraService:
             for event_time, controls in reversed(self.control_history):
                 if event_time <= timestamp:
                     return dict(controls)
-            return dict(self.active_controls)
+            return dict(self.effective_controls)
 
     def _minimum_free_bytes(self) -> int:
         return int(float(self.config["storage"].get("min_free_mb", 512)) * 1024 * 1024)
@@ -541,33 +891,50 @@ class CameraService:
     ) -> None:
         now = time.time()
         rows: list[list[Any]] = []
-        candidates = sorted(
-            [*session_dir.glob("pending_*.jpg"), *session_dir.glob("photo_*.jpg")]
-        )
+        candidates: list[Path] = []
+        # Scan already-finalized photographs only once. During normal capture,
+        # ffmpeg writes predictable consecutive pending names, so checking the
+        # next expected path avoids repeatedly walking an ever-growing folder.
+        if not self.legacy_scan_complete:
+            candidates.extend(sorted(session_dir.glob("photo_*.jpg")))
+            self.legacy_scan_complete = True
+        scan_number = self.next_pending_number
+        while True:
+            pending = session_dir / f"pending_{scan_number:08d}.jpg"
+            if not pending.exists():
+                break
+            candidates.append(pending)
+            scan_number += 1
         for photo in candidates:
             if photo.name in self.manifested_photos:
                 continue
+            pending_match = PENDING_PHOTO.fullmatch(photo.name)
             try:
                 stat = photo.stat()
             except FileNotFoundError:
+                if pending_match:
+                    break
                 continue
             # ffmpeg can leave a zero-byte placeholder when capture is
             # interrupted after opening the next JPEG but before writing it.
             # This is not a completed photograph.
             if stat.st_size == 0:
+                if pending_match:
+                    break
                 continue
             # Avoid recording a file while ffmpeg may still be writing it.
             if not include_recent and now - stat.st_mtime < 0.25:
+                if pending_match:
+                    break
                 continue
 
-            pending_match = PENDING_PHOTO.fullmatch(photo.name)
             if pending_match:
                 with self.lock:
                     capture_unix_us = self.frame_timestamps_us.pop(
                         photo.name, None
                     )
                 if capture_unix_us is None and not include_recent:
-                    continue
+                    break
                 capture_source = (
                     "v4l2_pts_abs"
                     if capture_unix_us is not None
@@ -616,6 +983,8 @@ class CameraService:
                 ]
             )
             self.manifested_photos.add(photo.name)
+            if pending_match:
+                self.next_pending_number = int(pending_match.group(1)) + 1
 
         if rows:
             with (session_dir / "manifest.csv").open(
@@ -625,6 +994,8 @@ class CameraService:
                 writer.writerows(rows)
                 handle.flush()
                 os.fsync(handle.fileno())
+            with self.lock:
+                self.photo_count += len(rows)
 
     @staticmethod
     def _next_photo_number(session_dir: Path) -> int:
@@ -698,6 +1069,9 @@ class CameraService:
             self.frame_timestamps_us = {}
             self.ffmpeg_reader_threads = {}
             self.control_history = []
+            self.photo_count = 0
+            self.next_pending_number = 1
+            self.legacy_scan_complete = True
             with (session_dir / "manifest.csv").open(
                 "w", encoding="utf-8", newline=""
             ) as handle:
@@ -910,6 +1284,8 @@ class CameraService:
                     return
 
                 next_number = self._next_photo_number(session_dir)
+                with self.lock:
+                    self.next_pending_number = next_number
                 try:
                     if not Path(self.device).exists():
                         raise AirCamError(f"找不到摄像头设备：{self.device}")
@@ -986,23 +1362,21 @@ class CameraService:
     def get_status(self) -> dict[str, Any]:
         with self.lock:
             status = self.status.as_dict()
-            session_dir = (
-                self.data_dir / self.status.session
-                if self.status.session
-                else None
-            )
-            status["photo_count"] = (
-                sum(1 for _ in session_dir.glob("photo_*.jpg"))
-                if session_dir and session_dir.is_dir()
-                else 0
-            )
+            status["photo_count"] = self.photo_count
             disk = shutil.disk_usage(self.data_dir)
             status["disk"] = {
                 "free_bytes": disk.free,
                 "total_bytes": disk.total,
             }
             status["device"] = self.device
-            status["active_controls"] = dict(self.active_controls)
+            status["data_dir"] = str(self.data_dir)
+            # Keep active_controls as a compatibility alias, but expose the
+            # requested/configured values separately from hardware readback.
+            status["active_controls"] = dict(self.effective_controls)
+            status["effective_controls"] = dict(self.effective_controls)
+            status["requested_controls"] = dict(self.active_controls)
+            status["configured_controls"] = dict(self.configured_controls)
+            status["controls_read_at"] = self.controls_read_at
             status["export_active"] = self.export_active
             deadline = self.stop_deadline_monotonic
             status["remaining_seconds"] = (
@@ -1124,6 +1498,7 @@ class CameraService:
             if self.status.session == session_name:
                 self.status = CaptureStatus()
                 self.session_dir = None
+                self.photo_count = 0
                 self._save_state()
             return {"deleted_session": session_name}
 
@@ -1145,6 +1520,7 @@ class CameraService:
                     deleted_sessions += 1
             self.status = CaptureStatus()
             self.session_dir = None
+            self.photo_count = 0
             self._save_state()
             return {"deleted_sessions": deleted_sessions}
 
@@ -1243,6 +1619,825 @@ class GpioTrigger:
     def close(self) -> None:
         if self.device is not None:
             self.device.close()
+
+
+class PwmTrigger:
+    """Measure a 3.3 V servo PWM signal and control capture safely."""
+
+    def __init__(
+        self,
+        service: CameraService,
+        config: dict[str, Any],
+        device_factory: Callable[..., Any] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
+        self.service = service
+        self.config = config
+        self.device_factory = device_factory
+        self.clock = clock
+        self.clock_ns = clock_ns
+        self.device: Any = None
+        self.gpio_chip: Any = None
+        self.gpio_line: Any = None
+        self.uses_kernel_timestamps = False
+        self.thread: threading.Thread | None = None
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.rise_ns: int | None = None
+        self.previous_rise_ns: int | None = None
+        self.last_valid_pulse: float | None = None
+        self.last_pulse_seen: float | None = None
+        self.last_pwm: int | None = None
+        self.frequency_hz: float | None = None
+        self.pulse_count = 0
+        self.invalid_pulse_count = 0
+        self.commanded_active: bool | None = None
+        self.pending_active: bool | None = None
+        self.pending_since: float | None = None
+        self.pending_first_pulse_count: int | None = None
+        self.last_error: str | None = None
+
+    def start(self) -> None:
+        if not self.config.get("enabled", False):
+            return
+        if self.device_factory is None:
+            try:
+                import gpiod
+            except ImportError as exc:
+                raise AirCamError(
+                    "PWM 触发已启用，但缺少 gpiod；请安装 python3-libgpiod"
+                ) from exc
+            pin = int(self.config.get("bcm_pin", 17))
+            gpiochip = int(self.config.get("gpiochip", 4))
+            try:
+                chip = gpiod.Chip(f"gpiochip{gpiochip}")
+            except Exception as exc:
+                raise AirCamError(
+                    f"无法打开 gpiochip{gpiochip}：{exc}"
+                ) from exc
+            try:
+                line = chip.get_line(pin)
+                flags = getattr(gpiod, "LINE_REQ_FLAG_BIAS_PULL_DOWN", 0)
+                line.request(
+                    consumer="aircam-pwm",
+                    type=gpiod.LINE_REQ_EV_BOTH_EDGES,
+                    flags=flags,
+                )
+            except Exception as exc:
+                try:
+                    chip.close()
+                except Exception:
+                    pass
+                raise AirCamError(
+                    f"无法申请 gpiochip{gpiochip} 的 BCM{pin} 输入：{exc}"
+                ) from exc
+            self.gpio_chip = chip
+            self.gpio_line = line
+            self.device = line
+            self.uses_kernel_timestamps = True
+        else:
+            pin = int(self.config.get("bcm_pin", 17))
+            self.device = self.device_factory(pin=pin, pull_up=False)
+            self.device.when_activated = self._on_rising_edge
+            self.device.when_deactivated = self._on_falling_edge
+        self.stop_event.clear()
+        monitor_target = (
+            self._monitor_gpiod if self.gpio_line is not None else self._monitor
+        )
+        self.thread = threading.Thread(
+            target=monitor_target,
+            name="pwm-trigger",
+            daemon=True,
+        )
+        self.thread.start()
+        LOG.info(
+            "PWM trigger enabled: BCM%s start>=%sus stop<=%sus timeout=%ss",
+            pin,
+            self.config.get("start_pwm", 1700),
+            self.config.get("stop_pwm", 1300),
+            self.config.get("timeout_seconds", 0.5),
+        )
+
+    def _record_rising_edge(self, now_ns: int) -> None:
+        with self.lock:
+            previous = self.previous_rise_ns
+            if previous is not None:
+                period_ns = now_ns - previous
+                if 5_000_000 <= period_ns <= 100_000_000:
+                    self.frequency_hz = round(1_000_000_000 / period_ns, 1)
+            self.previous_rise_ns = now_ns
+            self.rise_ns = now_ns
+
+    def _record_falling_edge(self, now_ns: int, now: float) -> None:
+        with self.lock:
+            rise_ns = self.rise_ns
+            self.rise_ns = None
+        if rise_ns is None or now_ns <= rise_ns:
+            return
+        self._record_pulse((now_ns - rise_ns) / 1000.0, now)
+
+    def _on_rising_edge(self) -> None:
+        self._record_rising_edge(self.clock_ns())
+
+    def _on_falling_edge(self) -> None:
+        self._record_falling_edge(self.clock_ns(), self.clock())
+
+    def _on_kernel_edge(self, level: int, tick: int) -> None:
+        # libgpiod supplies the kernel event timestamp in nanoseconds; using it
+        # avoids Python thread scheduling latency distorting the pulse width.
+        if level == 1:
+            self._record_rising_edge(int(tick))
+        elif level == 0:
+            self._record_falling_edge(int(tick), self.clock())
+
+    def _record_pulse(self, pulse_us: float, now: float) -> None:
+        minimum = int(self.config.get("min_valid_pwm", 750))
+        maximum = int(self.config.get("max_valid_pwm", 2250))
+        with self.lock:
+            if not minimum <= pulse_us <= maximum:
+                self.invalid_pulse_count += 1
+                return
+            self.last_pwm = round(pulse_us)
+            self.last_valid_pulse = now
+            self.last_pulse_seen = now
+            self.pulse_count += 1
+            self.last_error = None
+
+    def _monitor(self) -> None:
+        while not self.stop_event.wait(0.02):
+            self._evaluate(self.clock())
+
+    def _monitor_gpiod(self) -> None:
+        try:
+            import gpiod
+
+            line = self.gpio_line
+            while not self.stop_event.is_set():
+                if line is not None and line.event_wait(
+                    sec=0, nsec=20_000_000
+                ):
+                    event = line.event_read()
+                    level = (
+                        1
+                        if event.type == gpiod.LineEvent.RISING_EDGE
+                        else 0
+                    )
+                    self._on_kernel_edge(level, event.timestamp)
+                self._evaluate(self.clock())
+        except Exception as exc:
+            if not self.stop_event.is_set():
+                with self.lock:
+                    self.last_error = f"GPIO 边沿读取失败：{exc}"
+                    self.device = None
+                LOG.exception("PWM GPIO event loop failed")
+                self._fail_safe("gpio_error")
+
+    def _evaluate(self, now: float) -> None:
+        action: bool | None = None
+        timed_out = False
+        with self.lock:
+            last = self.last_valid_pulse
+            timeout = float(self.config.get("timeout_seconds", 0.5))
+            if last is not None and now - last >= timeout:
+                self.last_valid_pulse = None
+                self.pending_active = None
+                self.pending_since = None
+                self.pending_first_pulse_count = None
+                timed_out = True
+            elif last is not None and self.last_pwm is not None:
+                start_pwm = int(self.config.get("start_pwm", 1700))
+                stop_pwm = int(self.config.get("stop_pwm", 1300))
+                desired = (
+                    True
+                    if self.last_pwm >= start_pwm
+                    else False
+                    if self.last_pwm <= stop_pwm
+                    else None
+                )
+                if desired is None or desired == self.commanded_active:
+                    self.pending_active = None
+                    self.pending_since = None
+                    self.pending_first_pulse_count = None
+                elif desired != self.pending_active:
+                    self.pending_active = desired
+                    self.pending_since = now
+                    self.pending_first_pulse_count = self.pulse_count
+                else:
+                    debounce = float(
+                        self.config.get("debounce_seconds", 0.15)
+                    )
+                    minimum_pulses = int(
+                        self.config.get("min_stable_pulses", 5)
+                    )
+                    if (
+                        self.pending_since is not None
+                        and now - self.pending_since >= debounce
+                        and self.pending_first_pulse_count is not None
+                        and self.pulse_count - self.pending_first_pulse_count + 1
+                        >= minimum_pulses
+                    ):
+                        action = desired
+
+        if timed_out:
+            self._fail_safe("pwm_timeout")
+        elif action is not None:
+            self._apply_action(action)
+
+    def _apply_action(self, active: bool) -> None:
+        try:
+            if active:
+                state = self.service.get_status()["state"]
+                if state not in {"starting", "capturing", "recovering"}:
+                    self.service.start()
+                LOG.info("PWM capture start: pulse=%sus", self.last_pwm)
+            else:
+                self.service.stop()
+                LOG.info("PWM capture stop: pulse=%sus", self.last_pwm)
+        except Exception as exc:
+            with self.lock:
+                self.last_error = f"PWM 控制拍照失败：{exc}"
+                self.pending_since = self.clock()
+            LOG.exception("PWM capture action failed")
+            return
+        with self.lock:
+            self.commanded_active = active
+            self.pending_active = None
+            self.pending_since = None
+            self.pending_first_pulse_count = None
+
+    def _fail_safe(self, reason: str) -> None:
+        with self.lock:
+            should_handle = (
+                self.last_pulse_seen is not None
+                or self.commanded_active is not None
+            )
+            self.pending_active = None
+            self.pending_since = None
+            self.pending_first_pulse_count = None
+        if not should_handle:
+            return
+        if self.config.get("stop_on_timeout", True):
+            try:
+                self.service.stop()
+                LOG.warning("PWM fail-safe stopped capture: %s", reason)
+            except Exception as exc:
+                with self.lock:
+                    self.last_error = f"PWM 超时停止失败：{exc}"
+                LOG.exception("PWM fail-safe stop failed: %s", reason)
+        with self.lock:
+            self.commanded_active = None
+
+    @staticmethod
+    def _age(now: float, timestamp: float | None) -> float | None:
+        if timestamp is None:
+            return None
+        return round(max(0.0, now - timestamp), 2)
+
+    def get_status(self, now: float | None = None) -> dict[str, Any]:
+        enabled = bool(self.config.get("enabled", False))
+        current = self.clock() if now is None else now
+        with self.lock:
+            age = self._age(current, self.last_pulse_seen)
+            timeout = float(self.config.get("timeout_seconds", 0.5))
+            fresh = age is not None and age < timeout
+            if not enabled:
+                signal_state = "disabled"
+            elif self.device is None:
+                signal_state = "gpio_error" if self.last_error else "connecting"
+            elif fresh:
+                signal_state = "ready"
+            elif self.last_pulse_seen is not None:
+                signal_state = "signal_timeout"
+            else:
+                signal_state = "waiting_signal"
+
+            start_pwm = int(self.config.get("start_pwm", 1700))
+            stop_pwm = int(self.config.get("stop_pwm", 1300))
+            if self.last_pwm is None:
+                switch_position = "unknown"
+            elif self.last_pwm >= start_pwm:
+                switch_position = "start"
+            elif self.last_pwm <= stop_pwm:
+                switch_position = "stop"
+            else:
+                switch_position = "middle"
+
+            return {
+                "enabled": enabled,
+                "signal_state": signal_state,
+                "gpio_connected": self.device is not None,
+                "bcm_pin": int(self.config.get("bcm_pin", 17)),
+                "gpiochip": int(self.config.get("gpiochip", 4)),
+                "timestamp_source": (
+                    "gpiod_kernel_event"
+                    if self.uses_kernel_timestamps
+                    else "test_callback_clock"
+                ),
+                "pwm": self.last_pwm,
+                "frequency_hz": self.frequency_hz,
+                "pulse_count": self.pulse_count,
+                "invalid_pulse_count": self.invalid_pulse_count,
+                "last_pulse_age_seconds": age,
+                "start_pwm": start_pwm,
+                "stop_pwm": stop_pwm,
+                "switch_position": switch_position,
+                "commanded_active": self.commanded_active,
+                "last_error": self.last_error,
+            }
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=2)
+        if self.gpio_line is not None:
+            try:
+                self.gpio_line.release()
+            except Exception:
+                LOG.exception("failed to release PWM GPIO line")
+            self.gpio_line = None
+        if self.gpio_chip is not None:
+            try:
+                self.gpio_chip.close()
+            except Exception:
+                LOG.exception("failed to close PWM gpiochip")
+            self.gpio_chip = None
+            self.device = None
+        elif self.device is not None:
+            try:
+                self.device.close()
+            except Exception:
+                LOG.exception("failed to close PWM GPIO input")
+            self.device = None
+
+
+def mavlink_x25_crc(data: bytes, extra: int) -> int:
+    """Return the MAVLink X.25 checksum for a header/payload and CRC extra."""
+
+    crc = 0xFFFF
+    for byte in (*data, extra):
+        temporary = byte ^ (crc & 0xFF)
+        temporary ^= (temporary << 4) & 0xFF
+        crc = (
+            (crc >> 8)
+            ^ (temporary << 8)
+            ^ (temporary << 3)
+            ^ (temporary >> 4)
+        ) & 0xFFFF
+    return crc
+
+
+class MavlinkFrameParser:
+    """Incrementally extract checksum-validated MAVLink control frames."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def feed(self, data: bytes) -> list[tuple[int, int, int, bytes]]:
+        self.buffer.extend(data)
+        messages: list[tuple[int, int, int, bytes]] = []
+        while self.buffer:
+            start = next(
+                (
+                    index
+                    for index, byte in enumerate(self.buffer)
+                    if byte in (MAVLINK_V1_MAGIC, MAVLINK_V2_MAGIC)
+                ),
+                None,
+            )
+            if start is None:
+                self.buffer.clear()
+                break
+            if start:
+                del self.buffer[:start]
+
+            magic = self.buffer[0]
+            minimum_header = 6 if magic == MAVLINK_V1_MAGIC else 10
+            if len(self.buffer) < minimum_header:
+                break
+            payload_length = self.buffer[1]
+            if magic == MAVLINK_V1_MAGIC:
+                message_id = self.buffer[5]
+                system_id = self.buffer[3]
+                component_id = self.buffer[4]
+                payload_start = 6
+                signature_length = 0
+            else:
+                message_id = int.from_bytes(self.buffer[7:10], "little")
+                system_id = self.buffer[5]
+                component_id = self.buffer[6]
+                payload_start = 10
+                signature_length = (
+                    13 if self.buffer[2] & MAVLINK_V2_SIGNED_FLAG else 0
+                )
+            checksum_start = payload_start + payload_length
+            frame_length = checksum_start + 2 + signature_length
+            if len(self.buffer) < frame_length:
+                break
+
+            crc_extra = {
+                MAVLINK_HEARTBEAT_ID: MAVLINK_HEARTBEAT_CRC_EXTRA,
+                MAVLINK_RC_CHANNELS_ID: MAVLINK_RC_CHANNELS_CRC_EXTRA,
+            }.get(message_id)
+            if crc_extra is None:
+                del self.buffer[:frame_length]
+                continue
+
+            received_crc = int.from_bytes(
+                self.buffer[checksum_start : checksum_start + 2], "little"
+            )
+            calculated_crc = mavlink_x25_crc(
+                bytes(self.buffer[1:checksum_start]),
+                crc_extra,
+            )
+            if received_crc != calculated_crc:
+                # Drop only the bad magic byte so a valid frame nested in a
+                # corrupted length field can still be recovered.
+                del self.buffer[0]
+                continue
+
+            payload = bytes(self.buffer[payload_start:checksum_start])
+            messages.append((system_id, component_id, message_id, payload))
+            del self.buffer[:frame_length]
+        return messages
+
+
+def build_mavlink2_frame(
+    message_id: int,
+    payload: bytes,
+    crc_extra: int,
+    sequence: int,
+    system_id: int = 255,
+    component_id: int = 190,
+) -> bytes:
+    """Build an unsigned MAVLink 2 frame for the direct flight-controller link."""
+
+    header = bytes(
+        [
+            len(payload),
+            0,
+            0,
+            sequence & 0xFF,
+            system_id,
+            component_id,
+            message_id & 0xFF,
+            (message_id >> 8) & 0xFF,
+            (message_id >> 16) & 0xFF,
+        ]
+    )
+    checksum = mavlink_x25_crc(header + payload, crc_extra)
+    return (
+        bytes([MAVLINK_V2_MAGIC])
+        + header
+        + payload
+        + struct.pack("<H", checksum)
+    )
+
+
+class MavlinkTrigger:
+    """Use a MAVLink RC channel as a fail-safe start/stop level control."""
+
+    def __init__(
+        self,
+        service: CameraService,
+        config: dict[str, Any],
+        serial_factory: Callable[..., Any] | None = None,
+    ) -> None:
+        self.service = service
+        self.config = config
+        self.serial_factory = serial_factory
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.serial_port: Any = None
+        self.commanded_active: bool | None = None
+        self.pending_active: bool | None = None
+        self.pending_since: float | None = None
+        self.last_rc_message: float | None = None
+        self.last_rc_seen: float | None = None
+        self.last_pwm: int | None = None
+        self.last_byte_received: float | None = None
+        self.last_heartbeat: float | None = None
+        self.bytes_received = 0
+        self.heartbeat_count = 0
+        self.rc_message_count = 0
+        self.last_error: str | None = None
+        self.target_system: int | None = None
+        self.target_component: int | None = None
+        self.last_stream_request: float | None = None
+        self.sequence = 0
+
+    def start(self) -> None:
+        if not self.config.get("enabled", False):
+            return
+        if self.serial_factory is None:
+            try:
+                import serial
+            except ImportError as exc:
+                raise AirCamError(
+                    "MAVLink 已启用，但缺少 pyserial；请安装 python3-serial"
+                ) from exc
+            self.serial_factory = serial.Serial
+
+        self.stop_event.clear()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="mavlink-trigger",
+            daemon=True,
+        )
+        self.thread.start()
+        LOG.info(
+            "MAVLink trigger enabled: device=%s baud=%s RC%s",
+            self.config.get("device", "/dev/serial0"),
+            self.config.get("baud", 115200),
+            self.config.get("rc_channel", 9),
+        )
+
+    def _run(self) -> None:
+        device = str(self.config.get("device", "/dev/serial0"))
+        baud = int(self.config.get("baud", 115200))
+        reconnect_seconds = float(self.config.get("reconnect_seconds", 2))
+        while not self.stop_event.is_set():
+            parser = MavlinkFrameParser()
+            try:
+                assert self.serial_factory is not None
+                self.serial_port = self.serial_factory(
+                    device,
+                    baudrate=baud,
+                    timeout=0.2,
+                    write_timeout=0.5,
+                )
+                self.last_error = None
+                LOG.info("MAVLink serial connected: %s at %s baud", device, baud)
+                while not self.stop_event.is_set():
+                    data = self.serial_port.read(512)
+                    now = time.monotonic()
+                    if data:
+                        self.bytes_received += len(data)
+                        self.last_byte_received = now
+                    for system_id, component_id, message_id, payload in parser.feed(
+                        data
+                    ):
+                        if message_id == MAVLINK_HEARTBEAT_ID:
+                            self._handle_heartbeat(
+                                system_id, component_id, payload, now
+                            )
+                        elif message_id == MAVLINK_RC_CHANNELS_ID:
+                            self._handle_rc_channels(
+                                payload,
+                                now,
+                                system_id,
+                                component_id,
+                            )
+                    if (
+                        self.last_rc_message is None
+                        and self.target_system is not None
+                        and (
+                            self.last_stream_request is None
+                            or now - self.last_stream_request >= 5
+                        )
+                    ):
+                        self._request_rc_stream(now)
+                    self._check_timeout(now)
+            except Exception:
+                if not self.stop_event.is_set():
+                    self.last_error = "串口读取失败，正在自动重连"
+                    LOG.exception("MAVLink serial connection failed")
+                    self._fail_safe("serial_error")
+            finally:
+                port = self.serial_port
+                self.serial_port = None
+                if port is not None:
+                    try:
+                        port.close()
+                    except Exception:
+                        LOG.exception("failed to close MAVLink serial port")
+            if self.stop_event.wait(reconnect_seconds):
+                break
+
+    def _handle_heartbeat(
+        self,
+        system_id: int,
+        component_id: int,
+        payload: bytes,
+        now: float,
+    ) -> None:
+        # HEARTBEAT byte 5 is MAV_AUTOPILOT. Only the ArduPilot autopilot
+        # component may become the direct-link request target; routed GCS or
+        # companion-computer heartbeats must not retarget COMMAND_LONG.
+        if len(payload) < 9 or payload[5] != 3 or component_id != 1:
+            return
+        self.last_heartbeat = now
+        self.heartbeat_count += 1
+        if system_id != self.target_system or component_id != self.target_component:
+            self.target_system = system_id
+            self.target_component = component_id
+            self.last_stream_request = None
+            LOG.info(
+                "MAVLink heartbeat received: system=%s component=%s",
+                system_id,
+                component_id,
+            )
+        if self.last_stream_request is None:
+            self._request_rc_stream(now)
+
+    def _request_rc_stream(self, now: float) -> None:
+        if (
+            self.serial_port is None
+            or self.target_system is None
+            or self.target_component is None
+        ):
+            return
+        rate_hz = int(self.config.get("request_rate_hz", 10))
+        payload = struct.pack(
+            "<7fHBBB",
+            float(MAVLINK_RC_CHANNELS_ID),
+            1_000_000.0 / rate_hz,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            MAV_CMD_SET_MESSAGE_INTERVAL,
+            self.target_system,
+            self.target_component,
+            0,
+        )
+        frame = build_mavlink2_frame(
+            MAVLINK_COMMAND_LONG_ID,
+            payload,
+            MAVLINK_COMMAND_LONG_CRC_EXTRA,
+            self.sequence,
+        )
+        self.serial_port.write(frame)
+        self.sequence = (self.sequence + 1) & 0xFF
+        self.last_stream_request = now
+        LOG.info("requested RC_CHANNELS at %s Hz", rate_hz)
+
+    def _handle_rc_channels(
+        self,
+        payload: bytes,
+        now: float,
+        system_id: int = 0,
+        component_id: int = 0,
+    ) -> None:
+        channel = int(self.config.get("rc_channel", 9))
+        # MAVLink 2 may truncate trailing zero fields. RSSI is byte 41 and may
+        # therefore be omitted; byte 40 (chancount) is the last required byte.
+        if len(payload) < 41 or payload[40] < channel:
+            return
+        if self.target_system is not None and (
+            system_id != self.target_system
+            or component_id != self.target_component
+        ):
+            return
+        pwm = struct.unpack_from("<H", payload, 4 + (channel - 1) * 2)[0]
+        if pwm in (0, 0xFFFF) or not 500 <= pwm <= 2500:
+            return
+
+        first_message = self.last_rc_message is None
+        self.last_rc_message = now
+        self.last_rc_seen = now
+        self.last_pwm = pwm
+        self.rc_message_count += 1
+        if first_message:
+            LOG.info(
+                "MAVLink RC stream received: system=%s component=%s RC%s=%s",
+                system_id,
+                component_id,
+                channel,
+                pwm,
+            )
+
+        start_pwm = int(self.config.get("start_pwm", 1700))
+        stop_pwm = int(self.config.get("stop_pwm", 1300))
+        desired = True if pwm >= start_pwm else False if pwm <= stop_pwm else None
+        if desired is None:
+            self.pending_active = None
+            self.pending_since = None
+            return
+        if desired == self.commanded_active:
+            self.pending_active = None
+            self.pending_since = None
+            return
+        if desired != self.pending_active:
+            self.pending_active = desired
+            self.pending_since = now
+            return
+        debounce = float(self.config.get("debounce_seconds", 0.15))
+        if self.pending_since is None or now - self.pending_since < debounce:
+            return
+
+        try:
+            if desired:
+                state = self.service.get_status()["state"]
+                if state not in {"starting", "capturing", "recovering"}:
+                    self.service.start()
+                LOG.info("MAVLink RC%s=%s: capture start", channel, pwm)
+            else:
+                self.service.stop()
+                LOG.info("MAVLink RC%s=%s: capture stop", channel, pwm)
+        except Exception:
+            LOG.exception("MAVLink RC%s action failed", channel)
+            return
+        self.commanded_active = desired
+        self.pending_active = None
+        self.pending_since = None
+
+    def _check_timeout(self, now: float) -> None:
+        last = self.last_rc_message
+        if last is None:
+            return
+        timeout = float(self.config.get("timeout_seconds", 2))
+        if now - last >= timeout:
+            self._fail_safe("rc_timeout")
+
+    def _fail_safe(self, reason: str) -> None:
+        if self.last_rc_message is None and self.commanded_active is None:
+            return
+        self.last_rc_message = None
+        self.pending_active = None
+        self.pending_since = None
+        if self.config.get("stop_on_timeout", True):
+            try:
+                self.service.stop()
+                LOG.warning("MAVLink fail-safe stopped capture: %s", reason)
+            except Exception:
+                LOG.exception("MAVLink fail-safe stop failed: %s", reason)
+        self.commanded_active = None
+
+    @staticmethod
+    def _age(now: float, timestamp: float | None) -> float | None:
+        if timestamp is None:
+            return None
+        return round(max(0.0, now - timestamp), 1)
+
+    def get_status(self, now: float | None = None) -> dict[str, Any]:
+        """Return safe live diagnostics for the web console."""
+
+        enabled = bool(self.config.get("enabled", False))
+        current = time.monotonic() if now is None else now
+        serial_connected = self.serial_port is not None
+        rc_age = self._age(current, self.last_rc_seen)
+        timeout = float(self.config.get("timeout_seconds", 2))
+        rc_fresh = rc_age is not None and rc_age < timeout
+
+        if not enabled:
+            link_state = "disabled"
+        elif not serial_connected:
+            link_state = "serial_error" if self.last_error else "connecting"
+        elif rc_fresh:
+            link_state = "ready"
+        elif self.last_rc_seen is not None:
+            link_state = "rc_timeout"
+        elif self.last_heartbeat is not None:
+            link_state = "waiting_rc"
+        elif self.bytes_received:
+            link_state = "invalid_data"
+        else:
+            link_state = "waiting_data"
+
+        start_pwm = int(self.config.get("start_pwm", 1700))
+        stop_pwm = int(self.config.get("stop_pwm", 1300))
+        if self.last_pwm is None:
+            switch_position = "unknown"
+        elif self.last_pwm >= start_pwm:
+            switch_position = "start"
+        elif self.last_pwm <= stop_pwm:
+            switch_position = "stop"
+        else:
+            switch_position = "middle"
+
+        return {
+            "enabled": enabled,
+            "link_state": link_state,
+            "serial_connected": serial_connected,
+            "bytes_received": self.bytes_received,
+            "last_byte_age_seconds": self._age(current, self.last_byte_received),
+            "heartbeat_received": self.last_heartbeat is not None,
+            "heartbeat_count": self.heartbeat_count,
+            "heartbeat_age_seconds": self._age(current, self.last_heartbeat),
+            "rc_stream_received": self.last_rc_seen is not None,
+            "rc_message_count": self.rc_message_count,
+            "rc_age_seconds": rc_age,
+            "rc_channel": int(self.config.get("rc_channel", 9)),
+            "pwm": self.last_pwm,
+            "start_pwm": start_pwm,
+            "stop_pwm": stop_pwm,
+            "switch_position": switch_position,
+            "commanded_active": self.commanded_active,
+            "last_error": self.last_error,
+        }
+
+    def close(self) -> None:
+        self.stop_event.set()
+        port = self.serial_port
+        if port is not None:
+            try:
+                port.close()
+            except Exception:
+                LOG.exception("failed to interrupt MAVLink serial port")
+        if self.thread is not None and self.thread is not threading.current_thread():
+            self.thread.join(timeout=3)
 
 
 class ChunkedWriter:
@@ -1398,14 +2593,22 @@ class AirCamHandler(BaseHTTPRequestHandler):
             if not self._require_auth():
                 return
             if path == "/api/status":
+                status = self.app.camera.get_status()
+                status["pwm"] = self.app.pwm.get_status()
+                status["mavlink"] = self.app.mavlink.get_status()
                 self._json(
                     HTTPStatus.OK,
-                    {"ok": True, "status": self.app.camera.get_status()},
+                    {"ok": True, "status": status},
                 )
             elif path == "/api/controls":
+                state = self.app.camera.read_control_state()
                 self._json(
                     HTTPStatus.OK,
-                    {"ok": True, "raw": self.app.camera.list_controls()},
+                    {
+                        "ok": True,
+                        "raw": state.pop("raw"),
+                        "control_state": state,
+                    },
                 )
             elif path == "/api/latest":
                 photo = self.app.camera.latest_photo()
@@ -1462,7 +2665,14 @@ class AirCamHandler(BaseHTTPRequestHandler):
                 results = self.app.camera.set_controls(
                     payload.get("controls", {})
                 )
-                self._json(HTTPStatus.OK, {"ok": True, "controls": results})
+                self._json(
+                    HTTPStatus.OK,
+                    {
+                        "ok": True,
+                        "controls": results,
+                        "control_state": self.app.camera.control_state(),
+                    },
+                )
             elif path == "/api/sessions/clear":
                 if payload.get("confirm_text") != CLEAR_ALL_CONFIRMATION:
                     raise AirCamError(
@@ -1524,10 +2734,20 @@ class AirCamHttpServer(ThreadingHTTPServer):
         camera: CameraService,
         config: dict[str, Any],
         index_path: Path,
+        pwm: PwmTrigger | None = None,
+        mavlink: MavlinkTrigger | None = None,
     ) -> None:
         self.camera = camera
         self.config = config
         self.index_path = index_path
+        self.pwm = pwm or PwmTrigger(
+            camera,
+            config.get("pwm", {}),
+        )
+        self.mavlink = mavlink or MavlinkTrigger(
+            camera,
+            config.get("mavlink", {}),
+        )
         self.download_ticket_lock = threading.Lock()
         self.download_tickets: dict[str, tuple[float, str]] = {}
         bind_address = address
@@ -1563,10 +2783,12 @@ class AirCamHttpServer(ThreadingHTTPServer):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="AirCam USB camera service")
     parser.add_argument(
-        "--config", type=Path, default=Path("/etc/aircam/config.json")
+        "--config",
+        type=Path,
+        default=Path("/home/pi/AirCam/config/config.json"),
     )
     parser.add_argument(
-        "--web", type=Path, default=Path("/opt/aircam/web/index.html")
+        "--web", type=Path, default=Path("/home/pi/AirCam/web/index.html")
     )
     parser.add_argument(
         "--check-config",
@@ -1590,11 +2812,23 @@ def main() -> int:
             return 0
 
         camera = CameraService(config)
+        camera.initialize_controls()
         gpio = GpioTrigger(camera, config.get("gpio", {}))
         gpio.start()
+        pwm = PwmTrigger(camera, config.get("pwm", {}))
+        pwm.start()
+        mavlink = MavlinkTrigger(camera, config.get("mavlink", {}))
+        mavlink.start()
         host = str(config["server"].get("host", "0.0.0.0"))
         port = int(config["server"].get("port", 8080))
-        server = AirCamHttpServer((host, port), camera, config, args.web)
+        server = AirCamHttpServer(
+            (host, port),
+            camera,
+            config,
+            args.web,
+            pwm=pwm,
+            mavlink=mavlink,
+        )
 
         stopped = threading.Event()
 
@@ -1610,6 +2844,8 @@ def main() -> int:
             server.serve_forever(poll_interval=0.5)
         finally:
             server.server_close()
+            mavlink.close()
+            pwm.close()
             gpio.close()
             camera.shutdown()
         return 0
