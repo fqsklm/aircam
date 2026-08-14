@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-config="${AIR_CAM_CONFIG:-/etc/aircam/config.json}"
+config="${AIR_CAM_CONFIG:-/home/pi/AirCam/config/config.json}"
 capture_test=false
 if [[ "${1:-}" == "--capture" ]]; then
   capture_test=true

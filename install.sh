@@ -9,14 +9,16 @@ fi
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 apt-get update
-apt-get install -y acl curl ffmpeg v4l-utils python3-gpiozero python3-lgpio
+apt-get install -y acl curl ffmpeg v4l-utils python3-gpiozero python3-lgpio python3-libgpiod python3-serial
 
 if ! getent group gpio >/dev/null; then
   groupadd --system gpio
 fi
 if ! id aircam >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/aircam --create-home \
-    --shell /usr/sbin/nologin --groups video,gpio aircam
+    --shell /usr/sbin/nologin --groups video,gpio,dialout aircam
+else
+  usermod -a -G video,gpio,dialout aircam
 fi
 
 install -d -o pi -g pi -m 0755 \

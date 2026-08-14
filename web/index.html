@@ -116,6 +116,18 @@
     .stat { min-width:0; padding:13px 14px; border:1px solid var(--line); border-radius:13px; background:rgba(6,15,22,.48); }
     .stat-label { display:block; color:var(--muted); font-size:.72rem; margin-bottom:5px; }
     .stat-value { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:760; font-size:.92rem; }
+    .trigger-card { margin-bottom:20px; padding:14px; border:1px solid var(--line); border-radius:13px; background:rgba(6,15,22,.48); }
+    .trigger-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:11px; }
+    .trigger-title { font-size:.86rem; font-weight:760; }
+    .link-pill { padding:5px 9px; border:1px solid var(--line-strong); border-radius:999px; color:var(--muted); font-size:.72rem; font-weight:750; }
+    .link-pill.ready { color:#b9f3d2; border-color:rgba(84,217,140,.35); }
+    .link-pill.warning { color:#ffe5a6; border-color:rgba(255,200,87,.4); }
+    .link-pill.error { color:#ffb0b4; border-color:rgba(255,107,114,.4); }
+    .trigger-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:10px; }
+    .trigger-item { min-width:0; }
+    .trigger-item.wide { grid-column:span 2; }
+    .trigger-value { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.82rem; font-weight:720; }
+    .trigger-hint { margin:11px 0 0; color:var(--muted); font-size:.76rem; line-height:1.5; }
     .capture-grid { display:grid; grid-template-columns:minmax(0, 1fr) auto; gap:18px; align-items:end; }
     .field-label { display:block; margin-bottom:8px; color:#c4d1da; font-size:.86rem; font-weight:650; }
     .field-meta { display:flex; justify-content:space-between; gap:12px; margin-top:7px; color:var(--muted); font-size:.76rem; }
@@ -323,6 +335,7 @@
       .subtitle { display:none; }
       .connection span { display:none; }
       .stats { grid-template-columns:1fr 1fr; }
+      .trigger-grid { grid-template-columns:1fr 1fr; }
       .capture-grid { grid-template-columns:1fr; }
       .capture-actions { min-width:0; }
       .form-grid, .advanced-grid { grid-template-columns:1fr; }
@@ -375,6 +388,21 @@
             <div class="stat"><span class="stat-label">照片数量</span><span id="photoCount" class="stat-value">0</span></div>
             <div class="stat"><span class="stat-label">恢复次数</span><span id="restartCount" class="stat-value">0</span></div>
             <div class="stat"><span class="stat-label">剩余空间</span><span id="diskFree" class="stat-value">—</span></div>
+          </div>
+
+          <div class="trigger-card" aria-live="polite">
+            <div class="trigger-head">
+              <span class="trigger-title">飞控 PWM / GPIO17 遥控</span>
+              <span id="pwmBadge" class="link-pill">读取中</span>
+            </div>
+            <div class="trigger-grid">
+              <div class="trigger-item"><span class="stat-label">GPIO 输入</span><span id="pwmSignal" class="trigger-value">—</span></div>
+              <div class="trigger-item"><span class="stat-label">当前脉宽</span><span id="pwmValue" class="trigger-value">—</span></div>
+              <div class="trigger-item"><span class="stat-label">拨杆判定</span><span id="pwmSwitch" class="trigger-value">—</span></div>
+              <div class="trigger-item"><span class="stat-label">脉冲统计</span><span id="pwmPulses" class="trigger-value">—</span></div>
+              <div class="trigger-item wide"><span class="stat-label">照片保存位置（网页与遥控共用）</span><span id="photoDirectory" class="trigger-value">—</span></div>
+            </div>
+            <p id="pwmHint" class="trigger-hint">正在读取 PWM 信号状态…</p>
           </div>
 
           <div class="capture-grid">
@@ -436,11 +464,10 @@
           <div class="form-grid">
             <label>
               <span class="field-label">曝光模式</span>
-              <select id="auto_exposure">
-                <option value="3">自动曝光</option>
-                <option value="1">手动曝光</option>
+              <select id="auto_exposure" disabled>
+                <option value="">正在读取摄像头…</option>
               </select>
-              <span class="helper">高速飞行建议使用手动曝光并逐步缩短时间。</span>
+              <span id="exposureSupport" class="helper">等待硬件读回；不会用网页默认值覆盖摄像头。</span>
             </label>
             <div id="exposureBlock" class="exposure-block disabled">
               <label class="field-label" for="exposure_time_absolute">曝光时间 · <span id="exposureMs">10.0 ms</span></label>
@@ -459,7 +486,7 @@
           </div>
           <div class="panel-actions">
             <button id="loadControlsBtn" class="button secondary" type="button">读取摄像头支持项</button>
-            <button id="applyExposureBtn" class="button" type="button">应用曝光参数</button>
+            <button id="applyExposureBtn" class="button" type="button" disabled>应用曝光参数</button>
           </div>
           <pre id="controls" hidden></pre>
         </div>
@@ -516,7 +543,7 @@
               <textarea id="customControls" rows="5">{"white_balance_automatic":0,"white_balance_temperature":4500}</textarea>
             </label>
             <div>
-              <span class="field-label">当前生效参数</span>
+              <span class="field-label">摄像头硬件读回参数</span>
               <pre id="currentControls">{}</pre>
             </div>
             <div class="full panel-actions">
@@ -555,9 +582,15 @@ const stateLabels = {
   idle:"待机", starting:"启动中", capturing:"拍摄中", recovering:"恢复中",
   stopping:"停止中", error:"错误"
 };
+const pwmStateLabels = {
+  disabled:"未启用", connecting:"正在连接", waiting_signal:"等待 PWM 信号",
+  ready:"PWM 正常", signal_timeout:"PWM 信号超时", gpio_error:"GPIO 错误"
+};
 let latestStatus = null;
 let latestStatusReceivedAt = 0;
 let latestSessions = [];
+let latestControlState = null;
+let manualExposureValue = null;
 
 $("token").value = localStorage.getItem("aircamToken") || "";
 
@@ -606,6 +639,7 @@ async function runButton(button, busyText, confirmedText, task) {
     button.classList.remove("busy", "confirmed", "failed");
     button.textContent = originalText;
     applyStatus(latestStatus);
+    updateExposureUi();
   }
 }
 
@@ -741,6 +775,35 @@ function renderDurationStatus() {
   }
 }
 
+function applyPwmStatus(pwm, dataDir) {
+  const value = pwm || {enabled:false, signal_state:"disabled"};
+  const signalState = value.signal_state || "connecting";
+  const badge = $("pwmBadge");
+  badge.textContent = pwmStateLabels[signalState] || signalState;
+  badge.className = `link-pill ${signalState === "ready" ? "ready" : ["signal_timeout", "gpio_error"].includes(signalState) ? "error" : "warning"}`;
+
+  const age = Number.isFinite(value.last_pulse_age_seconds)
+    ? ` · ${value.last_pulse_age_seconds.toFixed(2)} 秒前`
+    : "";
+  $("pwmSignal").textContent = `BCM${value.bcm_pin ?? 17}${value.gpio_connected ? " 已就绪" : " 未就绪"}`;
+  const frequency = Number.isFinite(value.frequency_hz) ? ` · ${value.frequency_hz.toFixed(1)} Hz` : "";
+  $("pwmValue").textContent = Number.isFinite(value.pwm) ? `${value.pwm} µs${frequency}${age}` : "尚未收到";
+  const switchLabels = {start:"开始拍照", stop:"停止拍照", middle:"中间区间", unknown:"未知"};
+  $("pwmSwitch").textContent = switchLabels[value.switch_position] || value.switch_position || "未知";
+  $("pwmPulses").textContent = `有效 ${value.pulse_count || 0} / 异常 ${value.invalid_pulse_count || 0}`;
+  $("photoDirectory").textContent = dataDir || "—";
+
+  const hints = {
+    disabled:"PWM 遥控未启用。",
+    connecting:"正在申请树莓派 GPIO 输入。",
+    waiting_signal:"GPIO 已就绪但尚未收到合法 PWM；检查飞控 PWM9 信号到树莓派物理 11 脚、公共地、SERVO9_FUNCTION 和飞控安全开关。",
+    ready:`PWM 正常；脉宽 ≥ ${value.start_pwm} µs 开始拍照，≤ ${value.stop_pwm} µs 停止拍照。`,
+    signal_timeout:"之前收到过 PWM，但信号已经超时；AirCam 已执行安全停止。",
+    gpio_error:value.last_error || "无法读取树莓派 GPIO。"
+  };
+  $("pwmHint").textContent = hints[signalState] || "正在读取 PWM 信号状态。";
+}
+
 function applyStatus(status) {
   if (!status) return;
   const previousState = latestStatus && latestStatus.state;
@@ -754,7 +817,8 @@ function applyStatus(status) {
   $("photoCount").textContent = status.photo_count ?? 0;
   $("restartCount").textContent = status.restart_count ?? 0;
   $("diskFree").textContent = formatBytes(status.disk && status.disk.free_bytes);
-  $("currentControls").textContent = JSON.stringify(status.active_controls || {}, null, 2);
+  $("currentControls").textContent = JSON.stringify(status.effective_controls || status.active_controls || {}, null, 2);
+  applyPwmStatus(status.pwm, status.data_dir);
   renderDurationStatus();
 
   const alert = $("systemAlert");
@@ -801,7 +865,7 @@ async function refreshSessions() {
 }
 
 async function refreshAll() {
-  await Promise.all([refreshStatus({quiet:true}), refreshSessions()]);
+  await Promise.all([refreshStatus({quiet:true}), refreshSessions(), refreshControls()]);
 }
 
 function readInterval() {
@@ -864,18 +928,88 @@ function setDurationMinutes(value) {
   updateDurationUi();
 }
 
+function exposureModeLabel(label) {
+  const text = String(label || "");
+  if (/manual/i.test(text)) return "手动曝光";
+  if (/aperture/i.test(text)) return "光圈优先曝光";
+  if (/auto/i.test(text)) return "自动曝光";
+  return text || "未命名模式";
+}
+
+function applyControlState(state, {syncEditor=true}={}) {
+  if (!state || !state.controls) return;
+  latestControlState = state;
+  const auto = state.controls.auto_exposure;
+  const exposure = state.controls.exposure_time_absolute;
+  const select = $("auto_exposure");
+  const menu = auto && auto.menu ? auto.menu : {};
+  const entries = Object.entries(menu);
+  manualExposureValue = (entries.find(([, label]) => /manual/i.test(label)) || [])[0]
+    ?? (Object.prototype.hasOwnProperty.call(menu, "1") ? "1" : null);
+
+  select.replaceChildren();
+  if (auto && entries.length) {
+    for (const [value, label] of entries) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = exposureModeLabel(label);
+      select.appendChild(option);
+    }
+  } else if (auto && Number.isInteger(auto.value)) {
+    const option = document.createElement("option");
+    option.value = String(auto.value);
+    option.textContent = `模式 ${auto.value}`;
+    select.appendChild(option);
+  } else {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "摄像头不支持曝光模式控制";
+    select.appendChild(option);
+  }
+  select.disabled = !auto;
+  if (syncEditor && auto && Number.isInteger(auto.value)) select.value = String(auto.value);
+
+  if (exposure) {
+    for (const input of [$("exposureRange"), $("exposure_time_absolute")]) {
+      if (Number.isInteger(exposure.min)) input.min = String(exposure.min);
+      if (Number.isInteger(exposure.max)) input.max = String(exposure.max);
+      if (Number.isInteger(exposure.step)) input.step = String(exposure.step);
+    }
+    if (syncEditor && Number.isInteger(exposure.value)) {
+      $("exposureRange").value = String(exposure.value);
+      $("exposure_time_absolute").value = String(exposure.value);
+    }
+  }
+  $("currentControls").textContent = JSON.stringify(state.effective_controls || {}, null, 2);
+  const readTime = state.read_at ? new Date(state.read_at).toLocaleTimeString() : "刚刚";
+  $("exposureSupport").textContent = auto
+    ? `已按摄像头支持项同步（硬件读回 ${readTime}）；高速飞行可用手动曝光逐步缩短时间。`
+    : "此摄像头没有提供 auto_exposure 控制项，请使用下方自定义参数检查支持项。";
+  updateExposureUi();
+}
+
 function updateExposureUi() {
-  const manual = $("auto_exposure").value === "1";
-  const value = Math.min(2047, Math.max(3, Number($("exposure_time_absolute").value) || 3));
-  $("exposure_time_absolute").value = String(Math.round(value));
-  $("exposureRange").value = String(Math.round(value));
+  const exposure = latestControlState && latestControlState.controls
+    ? latestControlState.controls.exposure_time_absolute : null;
+  const manual = manualExposureValue !== null && $("auto_exposure").value === String(manualExposureValue);
+  const minimum = exposure && Number.isInteger(exposure.min) ? exposure.min : 0;
+  const maximum = exposure && Number.isInteger(exposure.max) ? exposure.max : 0;
+  let value = Number($("exposure_time_absolute").value);
+  if (!Number.isFinite(value)) value = minimum;
+  if (exposure) value = Math.min(maximum, Math.max(minimum, Math.round(value)));
+  $("exposure_time_absolute").value = String(value);
+  $("exposureRange").value = String(value);
   $("exposureMs").textContent = `${(value * .1).toFixed(1)} ms`;
-  $("exposureBlock").classList.toggle("disabled", !manual);
-  $("exposureRange").disabled = !manual;
-  $("exposure_time_absolute").disabled = !manual;
+  const editable = Boolean(exposure) && manual;
+  $("exposureBlock").classList.toggle("disabled", !editable);
+  $("exposureRange").disabled = !editable;
+  $("exposure_time_absolute").disabled = !editable;
+  $("applyExposureBtn").disabled = !latestControlState || !latestControlState.controls.auto_exposure || $("applyExposureBtn").dataset.busy === "true";
   document.querySelectorAll(".exposure-preset").forEach(button => {
-    button.disabled = !manual;
-    button.classList.toggle("selected", manual && Number(button.dataset.exposure) === value);
+    const preset = Number(button.dataset.exposure);
+    const step = exposure && Number.isInteger(exposure.step) ? exposure.step : 1;
+    button.disabled = !editable || preset < minimum || preset > maximum || (preset - minimum) % step !== 0;
+    button.classList.toggle("selected", editable && preset === value);
   });
 }
 
@@ -896,10 +1030,17 @@ async function stopCapture() {
 
 async function applyExposure() {
   const controls = {auto_exposure:Number($("auto_exposure").value)};
-  if (controls.auto_exposure === 1) {
-    controls.exposure_time_absolute = Number($("exposure_time_absolute").value);
+  if (!Number.isInteger(controls.auto_exposure)) throw new Error("曝光模式无效");
+  if (manualExposureValue !== null && String(controls.auto_exposure) === String(manualExposureValue)) {
+    const exposure = latestControlState && latestControlState.controls.exposure_time_absolute;
+    const value = Number($("exposure_time_absolute").value);
+    if (!exposure || !Number.isInteger(value) || value < exposure.min || value > exposure.max) {
+      throw new Error("曝光时间超出摄像头支持范围");
+    }
+    controls.exposure_time_absolute = value;
   }
-  await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
+  const body = await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
+  applyControlState(body.control_state);
   await refreshStatus({quiet:true});
 }
 
@@ -911,14 +1052,23 @@ async function applyCustomControls() {
   for (const [name, value] of Object.entries(controls)) {
     if (!Number.isInteger(value)) throw new Error(`${name} 的值必须是整数`);
   }
-  await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
+  const body = await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
+  applyControlState(body.control_state);
   await refreshStatus({quiet:true});
 }
 
-async function loadControls() {
+async function refreshControls({showRaw=false}={}) {
   const body = await api("/api/controls");
-  $("controls").hidden = false;
-  $("controls").textContent = body.raw;
+  applyControlState(body.control_state);
+  if (showRaw) {
+    $("controls").hidden = false;
+    $("controls").textContent = body.raw;
+  }
+  return body.control_state;
+}
+
+async function loadControls() {
+  return refreshControls({showRaw:true});
 }
 
 async function loadLatest() {
@@ -1076,7 +1226,7 @@ refreshAll().catch(() => {
 });
 window.setInterval(() => {
   if (!document.hidden) refreshStatus({quiet:true}).catch(() => {});
-}, 3000);
+}, 1000);
 window.setInterval(renderDurationStatus, 500);
 </script>
 </body>
