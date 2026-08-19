@@ -211,8 +211,8 @@
     .form-grid { display:grid; grid-template-columns:1fr 1.35fr; gap:16px; }
     .range-row { display:grid; grid-template-columns:minmax(120px, 1fr) 100px; gap:10px; align-items:center; }
     input[type=range] { padding:0; border:0; box-shadow:none; accent-color:var(--primary); background:transparent; }
-    .exposure-block.disabled { opacity:.46; }
-    .exposure-block.disabled .chip { pointer-events:none; }
+    .camera-control-block.disabled { opacity:.46; }
+    .camera-control-block.disabled .chip { pointer-events:none; }
     .panel-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:18px; }
     .alert {
       display:none;
@@ -469,7 +469,7 @@
               </select>
               <span id="exposureSupport" class="helper">等待硬件读回；不会用网页默认值覆盖摄像头。</span>
             </label>
-            <div id="exposureBlock" class="exposure-block disabled">
+            <div id="exposureBlock" class="camera-control-block disabled">
               <label class="field-label" for="exposure_time_absolute">曝光时间 · <span id="exposureMs">10.0 ms</span></label>
               <div class="range-row">
                 <input id="exposureRange" type="range" min="3" max="2047" step="1" value="100" disabled>
@@ -483,9 +483,26 @@
                 <button class="chip exposure-preset" type="button" data-exposure="300">30ms</button>
               </div>
             </div>
+            <div id="gainBlock" class="camera-control-block disabled">
+              <label class="field-label" for="gain">摄像头增益（Gain）· <span id="gainValue">等待读取</span></label>
+              <div class="range-row">
+                <input id="gainRange" type="range" min="0" max="1" step="1" value="0" disabled>
+                <input id="gain" type="number" inputmode="numeric" min="0" max="1" step="1" value="0" disabled>
+              </div>
+              <span id="gainSupport" class="helper">正在检查摄像头是否提供 gain 控制项。</span>
+            </div>
+            <div id="brightnessBlock" class="camera-control-block disabled">
+              <label class="field-label" for="brightness">数字亮度 · <span id="brightnessValue">等待读取</span></label>
+              <div class="range-row">
+                <input id="brightnessRange" type="range" min="-64" max="64" step="1" value="0" disabled>
+                <input id="brightness" type="number" inputmode="numeric" min="-64" max="64" step="1" value="0" disabled>
+              </div>
+              <span id="brightnessSupport" class="helper">亮度是图像处理参数，不能恢复已经过曝丢失的细节。</span>
+            </div>
           </div>
           <div class="panel-actions">
             <button id="loadControlsBtn" class="button secondary" type="button">读取摄像头支持项</button>
+            <button id="applyImageControlsBtn" class="button" type="button" disabled>应用增益/亮度</button>
             <button id="applyExposureBtn" class="button" type="button" disabled>应用曝光参数</button>
           </div>
           <pre id="controls" hidden></pre>
@@ -640,6 +657,7 @@ async function runButton(button, busyText, confirmedText, task) {
     button.textContent = originalText;
     applyStatus(latestStatus);
     updateExposureUi();
+    updateImageControlsUi();
   }
 }
 
@@ -936,11 +954,84 @@ function exposureModeLabel(label) {
   return text || "未命名模式";
 }
 
+const imageControlEditors = {
+  gain: {
+    block:"gainBlock", range:"gainRange", number:"gain", value:"gainValue", support:"gainSupport"
+  },
+  brightness: {
+    block:"brightnessBlock", range:"brightnessRange", number:"brightness", value:"brightnessValue", support:"brightnessSupport"
+  }
+};
+
+function controlIsInactive(control) {
+  const flags = control && control.flags;
+  if (Array.isArray(flags)) return flags.includes("inactive");
+  return String(flags || "").split(/[\s,]+/).includes("inactive");
+}
+
+function scalarControl(name) {
+  const control = latestControlState && latestControlState.controls
+    ? latestControlState.controls[name] : null;
+  return control && Number.isInteger(control.min) && Number.isInteger(control.max) ? control : null;
+}
+
+function scalarControlEditable(name) {
+  const control = scalarControl(name);
+  return Boolean(control) && !controlIsInactive(control);
+}
+
+function syncScalarControl(name, syncEditor) {
+  const editor = imageControlEditors[name];
+  const control = scalarControl(name);
+  if (!editor || !control) return;
+  for (const id of [editor.range, editor.number]) {
+    const input = $(id);
+    input.min = String(control.min);
+    input.max = String(control.max);
+    input.step = String(Number.isInteger(control.step) && control.step > 0 ? control.step : 1);
+  }
+  if (syncEditor && Number.isInteger(control.value)) {
+    $(editor.range).value = String(control.value);
+    $(editor.number).value = String(control.value);
+  }
+}
+
+function updateScalarControlUi(name) {
+  const editor = imageControlEditors[name];
+  const control = scalarControl(name);
+  const editable = scalarControlEditable(name);
+  let value = Number($(editor.number).value);
+  if (control) {
+    const step = Number.isInteger(control.step) && control.step > 0 ? control.step : 1;
+    if (!Number.isFinite(value)) value = Number.isInteger(control.value) ? control.value : control.min;
+    value = control.min + Math.round((value - control.min) / step) * step;
+    value = Math.min(control.max, Math.max(control.min, value));
+    $(editor.number).value = String(value);
+    $(editor.range).value = String(value);
+    $(editor.value).textContent = String(value);
+  } else {
+    $(editor.value).textContent = "不支持";
+  }
+  $(editor.block).classList.toggle("disabled", !editable);
+  $(editor.range).disabled = !editable;
+  $(editor.number).disabled = !editable;
+}
+
+function updateImageControlsUi() {
+  updateScalarControlUi("gain");
+  updateScalarControlUi("brightness");
+  const button = $("applyImageControlsBtn");
+  button.disabled = !scalarControlEditable("gain") && !scalarControlEditable("brightness")
+    || button.dataset.busy === "true";
+}
+
 function applyControlState(state, {syncEditor=true}={}) {
   if (!state || !state.controls) return;
   latestControlState = state;
   const auto = state.controls.auto_exposure;
   const exposure = state.controls.exposure_time_absolute;
+  const gain = state.controls.gain;
+  const brightness = state.controls.brightness;
   const select = $("auto_exposure");
   const menu = auto && auto.menu ? auto.menu : {};
   const entries = Object.entries(menu);
@@ -980,12 +1071,25 @@ function applyControlState(state, {syncEditor=true}={}) {
       $("exposure_time_absolute").value = String(exposure.value);
     }
   }
+  syncScalarControl("gain", syncEditor);
+  syncScalarControl("brightness", syncEditor);
   $("currentControls").textContent = JSON.stringify(state.effective_controls || {}, null, 2);
   const readTime = state.read_at ? new Date(state.read_at).toLocaleTimeString() : "刚刚";
   $("exposureSupport").textContent = auto
     ? `已按摄像头支持项同步（硬件读回 ${readTime}）；高速飞行可用手动曝光逐步缩短时间。`
     : "此摄像头没有提供 auto_exposure 控制项，请使用下方自定义参数检查支持项。";
+  $("gainSupport").textContent = !gain
+    ? "当前摄像头未提供 gain 控制项，网页无法修改真实增益。"
+    : controlIsInactive(gain)
+      ? "摄像头当前将 gain 标记为不可用；请先检查自动曝光或自动增益模式。"
+      : `硬件范围 ${gain.min}～${gain.max}，步长 ${gain.step || 1}；数值越低，传感器增益通常越小。`;
+  $("brightnessSupport").textContent = !brightness
+    ? "当前摄像头未提供 brightness 控制项。"
+    : controlIsInactive(brightness)
+      ? "摄像头当前将 brightness 标记为不可用。"
+      : `硬件范围 ${brightness.min}～${brightness.max}，默认 ${brightness.default ?? "未知"}；它不能恢复已经过曝丢失的细节。`;
   updateExposureUi();
+  updateImageControlsUi();
 }
 
 function updateExposureUi() {
@@ -1039,6 +1143,29 @@ async function applyExposure() {
     }
     controls.exposure_time_absolute = value;
   }
+  const body = await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
+  applyControlState(body.control_state);
+  await refreshStatus({quiet:true});
+}
+
+function readScalarControlValue(name) {
+  const control = scalarControl(name);
+  const editor = imageControlEditors[name];
+  const value = Number($(editor.number).value);
+  const step = control && Number.isInteger(control.step) && control.step > 0 ? control.step : 1;
+  if (!control || !scalarControlEditable(name) || !Number.isInteger(value)
+      || value < control.min || value > control.max || (value - control.min) % step !== 0) {
+    throw new Error(`${name} 数值超出摄像头支持范围`);
+  }
+  return value;
+}
+
+async function applyImageControls() {
+  const controls = {};
+  for (const name of ["gain", "brightness"]) {
+    if (scalarControlEditable(name)) controls[name] = readScalarControlValue(name);
+  }
+  if (!Object.keys(controls).length) throw new Error("当前摄像头没有可调的增益或亮度");
   const body = await api("/api/controls", {method:"POST", body:JSON.stringify({controls})});
   applyControlState(body.control_state);
   await refreshStatus({quiet:true});
@@ -1189,11 +1316,20 @@ document.querySelectorAll(".exposure-preset").forEach(button => {
     updateExposureUi();
   });
 });
+for (const name of ["gain", "brightness"]) {
+  const editor = imageControlEditors[name];
+  $(editor.range).addEventListener("input", () => {
+    $(editor.number).value = $(editor.range).value;
+    updateImageControlsUi();
+  });
+  $(editor.number).addEventListener("input", updateImageControlsUi);
+}
 
 $("refreshBtn").addEventListener("click", event => runButton(event.currentTarget, "刷新中", "状态已刷新", refreshAll).catch(() => {}));
 $("startBtn").addEventListener("click", event => runButton(event.currentTarget, "启动中", "拍照已开始", startCapture).catch(() => {}));
 $("stopBtn").addEventListener("click", event => runButton(event.currentTarget, "停止中", "拍照已结束，文件已安全关闭", stopCapture).catch(() => {}));
 $("applyExposureBtn").addEventListener("click", event => runButton(event.currentTarget, "应用中", "曝光参数已应用", applyExposure).catch(() => {}));
+$("applyImageControlsBtn").addEventListener("click", event => runButton(event.currentTarget, "应用中", "增益/亮度已应用", applyImageControls).catch(() => {}));
 $("loadControlsBtn").addEventListener("click", event => runButton(event.currentTarget, "读取中", "摄像头支持项已读取", loadControls).catch(() => {}));
 $("applyCustomBtn").addEventListener("click", event => runButton(event.currentTarget, "应用中", "自定义参数已应用", applyCustomControls).catch(() => {}));
 $("latestBtn").addEventListener("click", event => runButton(event.currentTarget, "加载中", "最新照片已加载", loadLatest).catch(() => {}));
@@ -1221,6 +1357,7 @@ $("saveTokenBtn").addEventListener("click", event => runButton(event.currentTarg
 updateIntervalUi();
 updateDurationUi();
 updateExposureUi();
+updateImageControlsUi();
 refreshAll().catch(() => {
   if (!$("token").value) $("settingsPanel").open = true;
 });
