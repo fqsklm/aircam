@@ -111,7 +111,7 @@ v4l2-ctl -d /dev/video0 --list-ctrls-menus
 | `white_balance_temperature` | 手动白平衡色温；通常要先关闭自动白平衡。 |
 | `power_line_frequency` | 电源频率防闪烁模式，具体菜单值由摄像头决定。 |
 | `backlight_compensation` | 逆光补偿。 |
-| `brightness`、`contrast`、`gain` 等 | 仅在摄像头列出并支持时才能设置。 |
+| `brightness`、`contrast`、`gain` 等 | 仅在摄像头列出并支持时才能设置。网页会动态显示 `gain` 和 `brightness` 的硬件范围；缺少 `gain` 时会明确提示不支持，不会伪造或强行提交该参数。 |
 
 ### 6.2 拍摄参数 `capture`
 

@@ -1184,6 +1184,11 @@ exposure_time_absolute 0x009a0902 (int) : min=3 max=2047 step=1 default=250 valu
         self.assertIn("function applyPwmStatus", page)
         self.assertIn("function applyControlState", page)
         self.assertIn("state.controls.exposure_time_absolute", page)
+        self.assertIn("state.controls.gain", page)
+        self.assertIn('id="gainRange"', page)
+        self.assertIn('id="brightnessRange"', page)
+        self.assertIn("function applyImageControls", page)
+        self.assertIn("当前摄像头未提供 gain 控制项", page)
         self.assertIn("摄像头硬件读回参数", page)
         self.assertIn("不会用网页默认值覆盖摄像头", page)
         self.assertIn('id="sessionList"', page)
@@ -1204,6 +1209,7 @@ exposure_time_absolute 0x009a0902 (int) : min=3 max=2047 step=1 default=250 valu
             "startBtn",
             "stopBtn",
             "applyExposureBtn",
+            "applyImageControlsBtn",
             "loadControlsBtn",
             "applyCustomBtn",
             "latestBtn",
