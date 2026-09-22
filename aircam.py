@@ -2785,10 +2785,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("/home/pi/AirCam/config/config.json"),
+        default=Path("/home/pi2/AirCam/config/config.json"),
     )
     parser.add_argument(
-        "--web", type=Path, default=Path("/home/pi/AirCam/web/index.html")
+        "--web", type=Path, default=Path("/home/pi2/AirCam/web/index.html")
     )
     parser.add_argument(
         "--check-config",

@@ -10,7 +10,7 @@ SupplementaryGroups=video gpio dialout
 RuntimeDirectory=aircam
 RuntimeDirectoryMode=0750
 WorkingDirectory=/run/aircam
-ExecStart=/usr/bin/python3 /home/pi/AirCam/aircam.py --config /home/pi/AirCam/config/config.json --web /home/pi/AirCam/web/index.html
+ExecStart=/usr/bin/python3 /home/pi2/AirCam/aircam.py --config /home/pi2/AirCam/config/config.json --web /home/pi2/AirCam/web/index.html
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
@@ -19,7 +19,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=false
 ProtectSystem=strict
-ReadWritePaths=/home/pi/AirCam/pictures
+ReadWritePaths=/home/pi2/AirCam/pictures
 
 [Install]
 WantedBy=multi-user.target

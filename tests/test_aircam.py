@@ -1161,7 +1161,7 @@ exposure_time_absolute 0x009a0902 (int) : min=3 max=2047 step=1 default=250 valu
         ).read_text(encoding="utf-8")
         self.assertIn("Restart=on-failure", unit)
         self.assertIn("WantedBy=multi-user.target", unit)
-        self.assertIn("ExecStart=/usr/bin/python3 /home/pi/AirCam/aircam.py", unit)
+        self.assertIn("ExecStart=/usr/bin/python3 /home/pi2/AirCam/aircam.py", unit)
         self.assertIn("RuntimeDirectory=aircam", unit)
         self.assertIn("WorkingDirectory=/run/aircam", unit)
 

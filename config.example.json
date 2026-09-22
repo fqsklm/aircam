@@ -20,7 +20,7 @@
     "restart_delay_seconds": 2
   },
   "storage": {
-    "data_dir": "/home/pi/AirCam/pictures",
+    "data_dir": "/home/pi2/AirCam/pictures",
     "min_free_mb": 512
   },
   "server": {
@@ -38,7 +38,7 @@
   "pwm": {
     "enabled": false,
     "bcm_pin": 17,
-    "gpiochip": 4,
+    "gpiochip": 0,
     "start_pwm": 1700,
     "stop_pwm": 1300,
     "min_valid_pwm": 750,

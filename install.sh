@@ -21,34 +21,34 @@ else
   usermod -a -G video,gpio,dialout aircam
 fi
 
-install -d -o pi -g pi -m 0755 \
-  /home/pi/AirCam /home/pi/AirCam/web /home/pi/AirCam/scripts \
-  /home/pi/AirCam/systemd
-install -d -o pi -g aircam -m 0750 /home/pi/AirCam/config
-install -d -o aircam -g pi -m 2770 /home/pi/AirCam/pictures
-setfacl -m u:aircam:--x /home/pi
-if [[ "$project_dir" != "/home/pi/AirCam" ]]; then
-  install -o pi -g pi -m 0755 "$project_dir/aircam.py" /home/pi/AirCam/aircam.py
-  install -o pi -g pi -m 0644 "$project_dir/web/index.html" /home/pi/AirCam/web/index.html
-  install -o pi -g pi -m 0755 \
+install -d -o pi2 -g pi2 -m 0755 \
+  /home/pi2/AirCam /home/pi2/AirCam/web /home/pi2/AirCam/scripts \
+  /home/pi2/AirCam/systemd
+install -d -o pi2 -g aircam -m 0750 /home/pi2/AirCam/config
+install -d -o aircam -g pi2 -m 2770 /home/pi2/AirCam/pictures
+setfacl -m u:aircam:--x /home/pi2
+if [[ "$project_dir" != "/home/pi2/AirCam" ]]; then
+  install -o pi2 -g pi2 -m 0755 "$project_dir/aircam.py" /home/pi2/AirCam/aircam.py
+  install -o pi2 -g pi2 -m 0644 "$project_dir/web/index.html" /home/pi2/AirCam/web/index.html
+  install -o pi2 -g pi2 -m 0755 \
     "$project_dir/scripts/probe-camera.sh" \
     "$project_dir/scripts/create-hotspot.sh" \
     "$project_dir/scripts/self-test.sh" \
-    /home/pi/AirCam/scripts/
-  install -o pi -g pi -m 0644 \
-    "$project_dir/systemd/aircam.service" /home/pi/AirCam/systemd/aircam.service
+    /home/pi2/AirCam/scripts/
+  install -o pi2 -g pi2 -m 0644 \
+    "$project_dir/systemd/aircam.service" /home/pi2/AirCam/systemd/aircam.service
 fi
 
-if [[ ! -f /home/pi/AirCam/config/config.json ]]; then
+if [[ ! -f /home/pi2/AirCam/config/config.json ]]; then
   token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
   sed "s/CHANGE_ME/$token/" "$project_dir/config.example.json" \
-    > /home/pi/AirCam/config/config.json
-  chown pi:aircam /home/pi/AirCam/config/config.json
-  chmod 0640 /home/pi/AirCam/config/config.json
+    > /home/pi2/AirCam/config/config.json
+  chown pi2:aircam /home/pi2/AirCam/config/config.json
+  chmod 0640 /home/pi2/AirCam/config/config.json
   echo "已生成访问令牌：$token"
-  echo "请立即保存；以后可在 /home/pi/AirCam/config/config.json 中查看或更改。"
+  echo "请立即保存；以后可在 /home/pi2/AirCam/config/config.json 中查看或更改。"
 else
-  echo "保留已有配置：/home/pi/AirCam/config/config.json"
+  echo "保留已有配置：/home/pi2/AirCam/config/config.json"
 fi
 
 install -o root -g root -m 0644 \
@@ -57,7 +57,7 @@ systemctl daemon-reload
 systemctl enable aircam.service
 
 echo
-echo "安装完成。请先编辑 /home/pi/AirCam/config/config.json，使分辨率和控制项匹配摄像头。"
-echo "验证配置：sudo -u aircam /usr/bin/python3 /home/pi/AirCam/aircam.py --config /home/pi/AirCam/config/config.json --check-config"
+echo "安装完成。请先编辑 /home/pi2/AirCam/config/config.json，使分辨率和控制项匹配摄像头。"
+echo "验证配置：sudo -u aircam /usr/bin/python3 /home/pi2/AirCam/aircam.py --config /home/pi2/AirCam/config/config.json --check-config"
 echo "启动服务：sudo systemctl start aircam"
 echo "查看日志：journalctl -u aircam -f"

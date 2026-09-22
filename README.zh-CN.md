@@ -59,7 +59,7 @@ chmod +x scripts/probe-camera.sh
 ```bash
 chmod +x install.sh uninstall.sh
 sudo ./install.sh
-sudo nano /home/pi/AirCam/config/config.json
+sudo nano /home/pi2/AirCam/config/config.json
 ```
 
 把 `device`、`input_format`、分辨率、帧率和 `controls` 改成探测报告中确实支持的值。如果某个控制项不存在，应从配置中删除。
@@ -67,8 +67,8 @@ sudo nano /home/pi/AirCam/config/config.json
 测试配置并启动：
 
 ```bash
-sudo -u aircam python3 /home/pi/AirCam/aircam.py \
-  --config /home/pi/AirCam/config/config.json \
+sudo -u aircam python3 /home/pi2/AirCam/aircam.py \
+  --config /home/pi2/AirCam/config/config.json \
   --check-config
 sudo systemctl start aircam
 systemctl status aircam --no-pager
@@ -82,7 +82,7 @@ journalctl -u aircam -n 100 --no-pager
 持久配置文件位于：
 
 ```text
-/home/pi/AirCam/config/config.json
+/home/pi2/AirCam/config/config.json
 ```
 
 “持久”表示服务重启或树莓派重新上电后仍然生效。`config.example.json` 是完整模板；实际运行时修改 `config/config.json`，不要只改示例文件。
@@ -132,7 +132,7 @@ v4l2-ctl -d /dev/video0 --list-ctrls-menus
 
 | 参数 | 模板值 | 允许范围 | 作用 |
 | --- | --- | --- | --- |
-| `data_dir` | `/home/pi/AirCam/pictures` | 有写权限的非空路径 | 照片、任务清单和状态文件的保存根目录。修改后不会自动搬迁旧照片。 |
+| `data_dir` | `/home/pi2/AirCam/pictures` | 有写权限的非空路径 | 照片、任务清单和状态文件的保存根目录。修改后不会自动搬迁旧照片。 |
 | `min_free_mb` | `512` | `16`–`1048576` MB | 磁盘最少保留空间。低于该值时拒绝开始拍摄；拍摄中低于该值时自动停止，防止磁盘被写满。 |
 
 ### 6.4 网页服务参数 `server`
@@ -203,9 +203,9 @@ AirCam 校验 MAVLink 1/2 帧和 `RC_CHANNELS` 校验和。开关位于中间区
 安全修改流程：
 
 ```bash
-sudo nano /home/pi/AirCam/config/config.json
-sudo -u aircam python3 /home/pi/AirCam/aircam.py \
-  --config /home/pi/AirCam/config/config.json \
+sudo nano /home/pi2/AirCam/config/config.json
+sudo -u aircam python3 /home/pi2/AirCam/aircam.py \
+  --config /home/pi2/AirCam/config/config.json \
   --check-config
 sudo systemctl restart aircam
 systemctl status aircam --no-pager
@@ -227,7 +227,7 @@ hostname -I
 http://树莓派IP:8080/
 ```
 
-输入安装脚本显示的访问令牌。令牌也保存在 `/home/pi/AirCam/config/config.json`。网页支持：
+输入安装脚本显示的访问令牌。令牌也保存在 `/home/pi2/AirCam/config/config.json`。网页支持：
 
 - 开始、结束连续拍照
 - 临时修改拍摄间隔
@@ -267,7 +267,7 @@ API 中的 `duration_seconds` 单位为秒；省略、传入 `null` 或传入 `0
 - “导入电脑”先通过已认证的API申请一个60秒有效、只能使用一次的下载链接。网页完整接收ZIP并显示进度后，再以`AirCam_任务编号.zip`交给浏览器保存，从而兼容不能正确结束未知长度网络下载的浏览器。
 - ZIP采用HTTP/1.1分块流式、仅存储模式发送。JPEG不会被重复压缩，树莓派也不会在照片分区生成第二份巨大压缩包。下载完成前不要关闭网页、断开网络或给树莓派断电。
 - 网页兼容导入限制为512 MB，因为接收过程中会占用电脑浏览器内存。更大的正式飞行任务应使用SFTP等支持断点续传的工具；浏览器下载被中断时，重新点击“导入电脑”即可从头下载，树莓派原照片不会被修改。
-- “删除任务”永久删除选中任务。“清空全部照片”要求输入同名确认文字，删除全部任务目录，但保留`/home/pi/AirCam/pictures`总目录和服务状态文件。
+- “删除任务”永久删除选中任务。“清空全部照片”要求输入同名确认文字，删除全部任务目录，但保留`/home/pi2/AirCam/pictures`总目录和服务状态文件。
 - 拍摄或恢复过程中禁止下载和清理；下载进行中也禁止开始新的拍摄，避免大量读取影响照片写入。
 - 导入电脑不会自动删除树莓派照片。确认电脑中的ZIP能够打开、照片数量正确后，再单独执行删除。
 
@@ -283,7 +283,7 @@ API 中的 `duration_seconds` 单位为秒；省略、传入 `null` 或传入 `0
 默认照片位于：
 
 ```text
-/home/pi/AirCam/pictures/
+/home/pi2/AirCam/pictures/
   state.json
   20260731_153000/
     session.json
@@ -429,7 +429,7 @@ sudo ./scripts/self-test.sh --capture
 
 第二条命令还会执行约4秒试拍。自检会检查树莓派型号、欠压/降频、温度、摄像头、存储、开机服务和本机API。
 
-安装完成后也可以直接运行`sudo /home/pi/AirCam/scripts/self-test.sh --capture`。
+安装完成后也可以直接运行`sudo /home/pi2/AirCam/scripts/self-test.sh --capture`。
 
 ## 13. 飞行可靠性检查
 
