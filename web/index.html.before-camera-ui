@@ -504,7 +504,6 @@
             <button id="loadControlsBtn" class="button secondary" type="button">读取摄像头支持项</button>
             <button id="applyImageControlsBtn" class="button" type="button" disabled>应用增益/亮度</button>
             <button id="applyExposureBtn" class="button" type="button" disabled>应用曝光参数</button>
-          <div id="skipNotice" class="alert" role="status"></div>
           </div>
           <pre id="controls" hidden></pre>
         </div>
@@ -563,7 +562,6 @@
             <div>
               <span class="field-label">摄像头硬件读回参数</span>
               <pre id="currentControls">{}</pre>
-              <p class="helper" id="cameraDevice"></p>
             </div>
             <div class="full panel-actions">
               <button id="applyCustomBtn" class="button" type="button">应用自定义参数</button>
@@ -839,11 +837,6 @@ function applyStatus(status) {
   $("diskFree").textContent = formatBytes(status.disk && status.disk.free_bytes);
   $("currentControls").textContent = JSON.stringify(status.effective_controls || status.active_controls || {}, null, 2);
   applyPwmStatus(status.pwm, status.data_dir);
-  $("cameraDevice").textContent = cameraDeviceLabel(status.device);
-  showSkippedControls(
-    status.skipped_controls
-    ?? (status.control_state && status.control_state.skipped_controls)
-  );
   renderDurationStatus();
 
   const alert = $("systemAlert");
@@ -1032,26 +1025,6 @@ function updateImageControlsUi() {
     || button.dataset.busy === "true";
 }
 
-function cameraDeviceLabel(device) {
-  return device ? `Camera device: ${device}` : "";
-}
-
-function showSkippedControls(skipped) {
-  const element = $("skipNotice");
-  if (!element) return;
-  const names = skipped && typeof skipped === "object"
-    ? Object.keys(skipped) : [];
-  if (!names.length) {
-    element.textContent = "";
-    element.classList.remove("visible");
-    return;
-  }
-  const detail = names.map(name => `${name}=${skipped[name]}`).join(", ");
-  element.textContent =
-    `Ignored camera controls this hardware does not support: ${detail}`;
-  element.classList.add("visible");
-}
-
 function applyControlState(state, {syncEditor=true}={}) {
   if (!state || !state.controls) return;
   latestControlState = state;
@@ -1089,18 +1062,9 @@ function applyControlState(state, {syncEditor=true}={}) {
 
   if (exposure) {
     for (const input of [$("exposureRange"), $("exposure_time_absolute")]) {
-      // Always overwrite: another camera has a different range and step, and
-      // stale markup values would silently clamp what the operator can set.
-      const lowest = Number.isInteger(exposure.min) ? exposure.min : 1;
-      input.min = String(lowest);
-      input.max = String(
-        Number.isInteger(exposure.max) && exposure.max > lowest
-          ? exposure.max : lowest
-      );
-      input.step = String(
-        Number.isInteger(exposure.step) && exposure.step > 0
-          ? exposure.step : 1
-      );
+      if (Number.isInteger(exposure.min)) input.min = String(exposure.min);
+      if (Number.isInteger(exposure.max)) input.max = String(exposure.max);
+      if (Number.isInteger(exposure.step)) input.step = String(exposure.step);
     }
     if (syncEditor && Number.isInteger(exposure.value)) {
       $("exposureRange").value = String(exposure.value);
@@ -1109,7 +1073,6 @@ function applyControlState(state, {syncEditor=true}={}) {
   }
   syncScalarControl("gain", syncEditor);
   syncScalarControl("brightness", syncEditor);
-  showSkippedControls(state.skipped_controls);
   $("currentControls").textContent = JSON.stringify(state.effective_controls || {}, null, 2);
   const readTime = state.read_at ? new Date(state.read_at).toLocaleTimeString() : "刚刚";
   $("exposureSupport").textContent = auto

@@ -592,16 +592,17 @@ class CameraService:
     def initialize_controls(self) -> dict[str, Any]:
         """Apply configured controls, tolerating controls this camera lacks.
 
-        A different camera may expose only a subset of the controls in the
-        config (for example it may not offer backlight_compensation). Missing
-        controls are skipped with a warning so the service still starts; the
-        rest are applied normally.
+        A camera may expose only a subset of the controls in the config (for
+        example another unit may not offer backlight_compensation or gain).
+        Missing or out-of-range entries are skipped with a warning so the
+        service still starts; the rest are applied normally.
         """
 
         if not self.active_controls:
             return self.read_control_state()
 
-        metadata = self.read_control_state()["controls"]
+        state = self.read_control_state()
+        metadata = state["controls"]
         applicable: dict[str, int | bool] = {}
         skipped: dict[str, int | bool] = {}
         for name, value in self.active_controls.items():
@@ -620,8 +621,19 @@ class CameraService:
             try:
                 self.set_controls(applicable)
             except AirCamError as exc:
-                # One unsettable entry must not stop the service.
-                LOG.warning("configured camera controls not fully applied: %s", exc)
+                # A range/menu mismatch must not stop the service either: keep
+                # whatever applied and report the rest as skipped.
+                LOG.warning(
+                    "configured camera controls not fully applied: %s", exc
+                )
+                with self.lock:
+                    applied_state = self.control_state()
+                effective = applied_state["effective_controls"]
+                for name in list(applicable):
+                    if name not in effective:
+                        skipped[name] = applicable.pop(name)
+                if applicable:
+                    self.set_controls(applicable)
         else:
             LOG.warning(
                 "none of the configured camera controls exist on %s; "

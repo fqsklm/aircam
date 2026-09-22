@@ -387,9 +387,6 @@ class CameraService:
             self.configured_controls
         )
         self.effective_controls: dict[str, int] = {}
-        # Controls present in the config but missing on this camera.
-        # They are skipped with a warning instead of blocking startup.
-        self.skipped_controls: dict[str, int | bool] = {}
         self.control_metadata: dict[str, dict[str, Any]] = {}
         self.controls_read_at: str | None = None
         self.control_history: list[tuple[float, dict[str, Any]]] = []
@@ -590,48 +587,10 @@ class CameraService:
                 raise AirCamError(f"{name} 不支持值 {value}")
 
     def initialize_controls(self) -> dict[str, Any]:
-        """Apply configured controls, tolerating controls this camera lacks.
-
-        A different camera may expose only a subset of the controls in the
-        config (for example it may not offer backlight_compensation). Missing
-        controls are skipped with a warning so the service still starts; the
-        rest are applied normally.
-        """
-
-        if not self.active_controls:
-            return self.read_control_state()
-
-        metadata = self.read_control_state()["controls"]
-        applicable: dict[str, int | bool] = {}
-        skipped: dict[str, int | bool] = {}
-        for name, value in self.active_controls.items():
-            if name in metadata:
-                applicable[name] = value
-                continue
-            skipped[name] = value
-            LOG.warning(
-                "camera.controls.%s=%r skipped: %s does not offer this control",
-                name,
-                value,
-                self.device,
-            )
-
-        if applicable:
-            try:
-                self.set_controls(applicable)
-            except AirCamError as exc:
-                # One unsettable entry must not stop the service.
-                LOG.warning("configured camera controls not fully applied: %s", exc)
-        else:
-            LOG.warning(
-                "none of the configured camera controls exist on %s; "
-                "continuing with camera defaults",
-                self.device,
-            )
-
-        with self.lock:
-            self.skipped_controls = skipped
-        return self.control_state()
+        if self.active_controls:
+            self.set_controls(dict(self.active_controls))
+            return self.control_state()
+        return self.read_control_state()
 
     def control_state(self) -> dict[str, Any]:
         """Return the last hardware readback without invoking v4l2-ctl."""
@@ -643,7 +602,6 @@ class CameraService:
                 "requested_controls": dict(self.active_controls),
                 "configured_controls": dict(self.configured_controls),
                 "read_at": self.controls_read_at,
-                "skipped_controls": dict(self.skipped_controls),
             }
 
     def _rollback_controls(
@@ -1419,7 +1377,6 @@ class CameraService:
             status["requested_controls"] = dict(self.active_controls)
             status["configured_controls"] = dict(self.configured_controls)
             status["controls_read_at"] = self.controls_read_at
-            status["skipped_controls"] = dict(self.skipped_controls)
             status["export_active"] = self.export_active
             deadline = self.stop_deadline_monotonic
             status["remaining_seconds"] = (
